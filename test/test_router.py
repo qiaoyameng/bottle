@@ -161,6 +161,105 @@ class TestRouter(unittest.TestCase):
             self.add('/<:>/'+str(i), str(i), 'GET')
         self.assertEqual(self.match('/foo/'+str(n-1))[0], str(n-1))
 
+    def diagnostic(self, routes):
+        for path, target, method in routes:
+            self.add(path, target, method)
+        return self.r.diagnose_routes()
+
+    def test_diagnostic_static_shadow(self):
+        report = self.diagnostic([
+            ('/files/<name:str>', 'dynamic', 'GET'),
+            ('/files/name', 'static', 'GET'),
+        ])
+        self.assertEqual([], report['unknown'])
+        conflict, = report['conflicts']
+        self.assertEqual('ambiguous', conflict['type'])
+        self.assertEqual('/files/name', conflict['witness'])
+        self.assertEqual('static', self.match('/files/name')[0])
+
+    def test_diagnostic_numeric_filters_intersect(self):
+        report = self.diagnostic([
+            ('/files/<id:int>', 'integer', 'GET'),
+            ('/files/<id:float>', 'floating', 'GET'),
+        ])
+        conflict, = report['conflicts']
+        self.assertEqual('ambiguous', conflict['type'])
+        self.assertEqual('integer', self.match(conflict['witness'])[0])
+        self.assertEqual(int, type(conflict['witness_args']['id']))
+
+    def test_diagnostic_path_capture(self):
+        report = self.diagnostic([
+            ('/files/<name:str>', 'name', 'GET'),
+            ('/files/<path:path>', 'path', 'GET'),
+        ])
+        conflict, = report['conflicts']
+        self.assertEqual('ambiguous', conflict['type'])
+        self.assertNotIn('/', conflict['witness'].rsplit('/', 1)[1])
+        self.assertEqual('name', self.match(conflict['witness'])[0])
+
+    def test_diagnostic_head_fallback(self):
+        report = self.diagnostic([
+            ('/files/<id:int>', 'integer', 'GET'),
+            ('/files/<id:float>', 'floating', 'HEAD'),
+        ])
+        conflict, = report['conflicts']
+        self.assertEqual('HEAD', conflict['witness_method'])
+        self.assertEqual('floating',
+                         self.match(conflict['witness'], 'HEAD')[0])
+        self.assertEqual(float, type(conflict['witness_args']['id']))
+
+    def test_diagnostic_disjoint_rules(self):
+        report = self.diagnostic([
+            ('/files/<id:int>', 'file', 'GET'),
+            ('/other/<id:int>', 'other', 'GET'),
+        ])
+        self.assertEqual({'conflicts': [], 'unknown': []}, report)
+
+    def test_diagnostic_unrelated_methods(self):
+        report = self.diagnostic([
+            ('/files/<id:int>', 'get', 'GET'),
+            ('/files/<id:int>', 'post', 'POST'),
+        ])
+        self.assertEqual({'conflicts': [], 'unknown': []}, report)
+
+    def test_diagnostic_full_shadow(self):
+        report = self.diagnostic([
+            ('/files/<id:float>', 'floating', 'GET'),
+            ('/files/<id:int>', 'integer', 'GET'),
+        ])
+        conflict, = report['conflicts']
+        self.assertEqual('shadowed', conflict['type'])
+        self.assertEqual('/files/<id:int>', conflict['shadowed_rule'])
+        self.assertEqual('floating', self.match(conflict['witness'])[0])
+
+    def test_diagnostic_unknown_regex_is_not_probed(self):
+        self.add('/files/<id:re:[a-z]+>', 'regex', 'GET')
+        self.add('/files/<id:str>', 'string', 'GET')
+        before = str(self.r.dyna_routes)
+        report = self.r.diagnose_routes()
+        self.assertEqual([], report['conflicts'])
+        unknown, = report['unknown']
+        self.assertIn('regular expression', unknown['reason'])
+        self.assertEqual('<id:re:[a-z]+>', unknown['segment'])
+        self.assertEqual(before, str(self.r.dyna_routes))
+
+    def test_diagnostic_legacy_custom_regex_is_unknown(self):
+        self.add('/:#[a-z]+#', 'legacy', 'GET')
+        unknown, = self.r.diagnose_routes()['unknown']
+        self.assertEqual(':#[a-z]+#', unknown['segment'])
+
+    def test_diagnostic_is_stable_and_read_only(self):
+        self.add('/files/<id:int>', 'integer', 'GET')
+        self.add('/files/<id:float>', 'floating', 'GET')
+        static_state = str(self.r.static)
+        dynamic_state = str(self.r.dyna_routes)
+        first = self.r.route_diagnostics()
+        second = self.r.route_diagnostics()
+        self.assertEqual(first, second)
+        self.assertEqual(static_state, str(self.r.static))
+        self.assertEqual(dynamic_state, str(self.r.dyna_routes))
+
+
 class TestRouterInCGIMode(TestRouter):
     ''' Makes no sense since the default route does not optimize CGI anymore.'''
     CGI = True

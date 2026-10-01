@@ -258,6 +258,330 @@ def _re_flatten(p):
                   len(m.group(1)) % 2 else m.group(1) + '(?:', p)
 
 
+class _RouterDiagnosticNFA:
+    __slots__ = ('start', 'accept', 'edges', 'epsilon')
+
+    def __init__(self):
+        self.edges = []
+        self.epsilon = []
+        self.edges.append([])
+        self.edges.append([])
+        self.epsilon.append(set())
+        self.epsilon.append(set())
+        self.start = 0
+        self.accept = 1
+
+    def state(self):
+        self.edges.append([])
+        self.epsilon.append(set())
+        return len(self.edges) - 1
+
+    def connect(self, source, symbols, target):
+        self.edges[source].append((frozenset(symbols), target))
+
+
+class _RouterDiagnosticAlphabet:
+    def __init__(self, literals):
+        decimal = next(chr(code) for code in range(128, sys.maxunicode + 1)
+                       if chr(code).isdecimal() and chr(code) not in literals)
+        other = next(chr(code) for code in range(0xE000, 0xF900)
+                     if chr(code) not in literals)
+
+        self.representatives = ['/', '\n', '-', '.'] + list('0123456789')
+        self.fixed = {'/': 0, '\n': 1, '-': 2, '.': 3}
+        for digit in '0123456789':
+            self.fixed[digit] = len(self.representatives)
+            self.representatives.append(digit)
+        self.decimal = len(self.representatives)
+        self.representatives.append(decimal)
+        self.other = len(self.representatives)
+        self.representatives.append(other)
+        self.extra = {}
+
+        for char in sorted(literals):
+            if char not in self.fixed and char != decimal and char != other:
+                self.extra[char] = len(self.representatives)
+                self.representatives.append(char)
+
+        self.all = frozenset(range(len(self.representatives)))
+        self.no_slash = frozenset(i for i in self.all if i != 0)
+        self.no_newline = frozenset(i for i in self.all if i != 1)
+        self.digits = set(range(4, 24))
+        self.digits.add(self.decimal)
+        for char in self.extra:
+            if char.isdecimal():
+                self.digits.add(self.extra[char])
+        self.digits = frozenset(self.digits)
+
+    def index(self, char):
+        if char in self.fixed:
+            return self.fixed[char]
+        if char in self.extra:
+            return self.extra[char]
+        if char.isdecimal():
+            return self.decimal
+        return self.other
+
+
+def _diagnostic_closure(nfa, states):
+    pending = list(states)
+    states = set(states)
+    while pending:
+        state = pending.pop()
+        for target in nfa.epsilon[state]:
+            if target not in states:
+                states.add(target)
+                pending.append(target)
+    return frozenset(states)
+
+
+def _diagnostic_move(nfa, states, symbol):
+    targets = set()
+    for state in states:
+        for symbols, target in nfa.edges[state]:
+            if symbol in symbols:
+                targets.add(target)
+    return _diagnostic_closure(nfa, targets)
+
+
+def _diagnostic_literal(nfa, alphabet, source, text):
+    for char in text:
+        target = nfa.state()
+        nfa.connect(source, [alphabet.index(char)], target)
+        source = target
+    return source
+
+
+def _diagnostic_one_or_more(nfa, symbols, source):
+    loop = nfa.state()
+    matched = nfa.state()
+    target = nfa.state()
+    nfa.connect(source, symbols, loop)
+    nfa.connect(loop, symbols, matched)
+    nfa.epsilon[matched].add(loop)
+    nfa.epsilon[loop].add(target)
+    return target
+
+
+def _diagnostic_optional(nfa, symbols, source):
+    matched = nfa.state()
+    target = nfa.state()
+    nfa.connect(source, symbols, matched)
+    nfa.epsilon[matched].add(target)
+    nfa.epsilon[source].add(target)
+    return target
+
+
+def _diagnostic_float(nfa, alphabet, source):
+    final = nfa.state()
+
+    integer_start = nfa.state()
+    nfa.epsilon[source].add(integer_start)
+    integer_part = _diagnostic_one_or_more(nfa, alphabet.digits, integer_start)
+    nfa.epsilon[integer_part].add(final)
+
+    optional_dot = nfa.state()
+    nfa.connect(integer_part, [3], optional_dot)
+    nfa.epsilon[optional_dot].add(final)
+    fraction_digit = nfa.state()
+    nfa.connect(optional_dot, alphabet.digits, fraction_digit)
+    fraction_part = nfa.state()
+    nfa.epsilon[fraction_digit].add(fraction_part)
+    nfa.connect(fraction_part, alphabet.digits, fraction_digit)
+    nfa.epsilon[fraction_part].add(final)
+
+    leading_dot = nfa.state()
+    nfa.epsilon[source].add(leading_dot)
+    dot = nfa.state()
+    nfa.connect(leading_dot, [3], dot)
+    fraction = _diagnostic_one_or_more(nfa, alphabet.digits, dot)
+    nfa.epsilon[fraction].add(final)
+    return final
+
+
+def _diagnostic_language(segments, alphabet):
+    nfa = _RouterDiagnosticNFA()
+    source = nfa.start
+    for kind, value in segments:
+        if kind == 'static':
+            source = _diagnostic_literal(nfa, alphabet, source, value)
+        elif kind == 'str':
+            source = _diagnostic_one_or_more(nfa, alphabet.no_slash, source)
+        elif kind == 'int':
+            source = _diagnostic_optional(nfa, [2], source)
+            source = _diagnostic_one_or_more(nfa, alphabet.digits, source)
+            target = nfa.state()
+            nfa.connect(source, [1], target)
+            nfa.epsilon[source].add(target)
+            source = target
+        elif kind == 'float':
+            source = _diagnostic_optional(nfa, [2], source)
+            source = _diagnostic_float(nfa, alphabet, source)
+            target = nfa.state()
+            nfa.connect(source, [1], target)
+            nfa.epsilon[source].add(target)
+            source = target
+        elif kind == 'path':
+            target = nfa.state()
+            source = _diagnostic_one_or_more(
+                nfa, alphabet.no_newline, source)
+            nfa.connect(source, [1], target)
+            nfa.epsilon[source].add(target)
+            source = target
+    nfa.epsilon[source].add(nfa.accept)
+    return nfa
+
+
+def _diagnostic_union(languages):
+    if len(languages) == 1:
+        return languages[0]
+
+    nfa = _RouterDiagnosticNFA()
+    for language in languages:
+        offset = len(nfa.edges)
+        for source, edges in enumerate(language.edges):
+            nfa.edges.append([(symbols, target + offset)
+                              for symbols, target in edges])
+            nfa.epsilon.append(set(target + offset
+                                   for target in language.epsilon[source]))
+        nfa.epsilon[nfa.start].add(language.start + offset)
+        nfa.epsilon[language.accept + offset].add(nfa.accept)
+    return nfa
+
+
+def _diagnostic_witness(parents, state, alphabet):
+    path = ''
+    while parents[state] is not None:
+        previous, symbol = parents[state]
+        path = alphabet.representatives[symbol] + path
+        state = previous
+    return path
+
+
+def _diagnostic_example(language, alphabet, blocker=None):
+    start = (_diagnostic_closure(language, [language.start]),)
+    if blocker is not None:
+        start += (_diagnostic_closure(blocker, [blocker.start]),)
+
+    queue = [start]
+    parents = {start: None}
+    for states in queue:
+        if language.accept in states[0] and (
+                blocker is None or blocker.accept not in states[1]):
+            return _diagnostic_witness(parents, states, alphabet)
+
+        for symbol in range(len(alphabet.representatives)):
+            next_state = (_diagnostic_move(language, states[0], symbol),)
+            if blocker is not None:
+                next_state += (_diagnostic_move(blocker, states[1], symbol),)
+            if next_state not in parents:
+                parents[next_state] = (states, symbol)
+                queue.append(next_state)
+
+
+def _diagnostic_intersection(first, second, alphabet, blocker=None):
+    start = (
+        _diagnostic_closure(first, [first.start]),
+        _diagnostic_closure(second, [second.start])
+    )
+    if blocker is not None:
+        start += (_diagnostic_closure(blocker, [blocker.start]),)
+
+    queue = [start]
+    parents = {start: None}
+    for states in queue:
+        if first.accept in states[0] and second.accept in states[1] and (
+                blocker is None or blocker.accept not in states[2]):
+            return _diagnostic_witness(parents, states, alphabet)
+
+        for symbol in range(len(alphabet.representatives)):
+            next_state = (
+                _diagnostic_move(first, states[0], symbol),
+                _diagnostic_move(second, states[1], symbol)
+            )
+            if blocker is not None:
+                next_state += (_diagnostic_move(blocker, states[2], symbol),)
+            if next_state not in parents:
+                parents[next_state] = (states, symbol)
+                queue.append(next_state)
+
+
+def _diagnostic_covers(language, cover, alphabet):
+    start = (
+        _diagnostic_closure(language, [language.start]),
+        _diagnostic_closure(cover, [cover.start])
+    )
+    queue = [start]
+    seen = {start}
+    while queue:
+        language_states, cover_states = queue.pop()
+        if language.accept in language_states and cover.accept not in cover_states:
+            return False
+        for symbol in range(len(alphabet.representatives)):
+            next_state = (
+                _diagnostic_move(language, language_states, symbol),
+                _diagnostic_move(cover, cover_states, symbol)
+            )
+            if next_state not in seen:
+                seen.add(next_state)
+                queue.append(next_state)
+    return True
+
+
+def _diagnostic_parse(router, rule):
+    raw_matches = [match for match in Router.rule_syntax.finditer(rule)
+                   if len(match.group(1)) % 2 == 0]
+    segments = []
+    unknown = []
+
+    for key, mode, conf in router._itertokens(rule):
+        if not mode:
+            segments.append(('static', key))
+            continue
+
+        raw = raw_matches.pop(0).group(0)
+        if mode == 'default':
+            resolved_mode = 're' if conf else router.default_filter
+            resolved_conf = conf
+        else:
+            resolved_mode = mode
+            resolved_conf = conf
+
+        active_filter = router.filters.get(resolved_mode)
+        builtin_filter = router._builtin_filters.get(resolved_mode)
+
+        if active_filter is not builtin_filter:
+            unknown.append((raw, "custom filter %r is outside the diagnostic "
+                                 "model" % resolved_mode))
+        elif resolved_mode in ('str', 'int', 'float', 'path'):
+            segments.append((resolved_mode, None))
+        elif resolved_mode == 're':
+            if resolved_conf is None or resolved_conf == '':
+                if router.default_pattern != router._builtin_default_pattern:
+                    unknown.append((raw, "default wildcard pattern was "
+                                         "changed"))
+                else:
+                    segments.append(('str', None))
+            else:
+                unknown.append((raw, "custom regular expression is outside "
+                                     "the diagnostic model"))
+        else:
+            unknown.append((raw, "filter %r is outside the diagnostic model"
+                                 % resolved_mode))
+
+    return segments, unknown
+
+
+def _diagnostic_bucket_order(method):
+    return {'PROXY': 0, 'HEAD': 1, 'GET': 2, 'ANY': 3}.get(method, 4)
+
+
+def _diagnostic_generic_method(methods):
+    for method in ('PATCH', 'PUT', 'POST', 'DELETE', 'OPTIONS', 'ROUTEDIAG'):
+        if method not in methods:
+            return method
+
+
 class Router:
     """ A Router is an ordered collection of route->target pairs. It is used to
         efficiently match WSGI requests against a number of routes and return
@@ -287,12 +611,15 @@ class Router:
         #: If true, static routes are no longer checked first.
         self.strict_order = strict
         self.filters = {
+            'str': lambda conf: (r'[^/]+', None, None),
             're': lambda conf: (_re_flatten(conf or self.default_pattern),
                                 None, None),
             'int': lambda conf: (r'-?\d+', int, lambda x: str(int(x))),
             'float': lambda conf: (r'-?[\d.]+', float, lambda x: str(float(x))),
             'path': lambda conf: (r'.+?', None, None)
         }
+        self._builtin_filters = dict(self.filters)
+        self._builtin_default_pattern = self.default_pattern
 
     def add_filter(self, name, func):
         """ Add a filter. The provided function is called with the configuration
@@ -462,6 +789,282 @@ class Router:
 
         # No matching route and no alternative method found. We give up
         raise HTTPError(404, "Not found: " + repr(path))
+
+    def diagnose_routes(self):
+        """ Return a read-only report about overlapping route languages.
+
+        Witness paths in the report are verified by :meth:`match` and by the
+        loser's input converter, so strings rejected by a filter are not
+        reported.
+        """
+        descriptors = []
+        unknown = []
+        literals = set()
+
+        for method in sorted(self.static, key=lambda item:
+                             (_diagnostic_bucket_order(item), item)):
+            for priority, (path, (target, getargs)) in enumerate(
+                    self.static[method].items()):
+                descriptor = {
+                    'id': len(descriptors),
+                    'method': method,
+                    'rule': path,
+                    'target': target,
+                    'getargs': getargs,
+                    'static': True,
+                    'priority': priority,
+                    'segments': [('static', path)]
+                }
+                descriptors.append(descriptor)
+                literals.update(path)
+
+        for method in sorted(self.dyna_routes, key=lambda item:
+                             (_diagnostic_bucket_order(item), item)):
+            for index, (rule, flatpat, target, getargs) in \
+                    enumerate(self.dyna_routes[method]):
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore')
+                    segments, unsupported = _diagnostic_parse(self, rule)
+                descriptor = {
+                    'id': len(descriptors),
+                    'method': method,
+                    'rule': rule,
+                    'target': target,
+                    'getargs': getargs,
+                    'static': all(kind == 'static'
+                                  for kind, value in segments),
+                    'priority': index,
+                    'segments': None if unsupported else segments
+                }
+                descriptors.append(descriptor)
+                if unsupported:
+                    for segment, reason in unsupported:
+                        unknown.append({
+                            'type': 'unknown',
+                            'method': method,
+                            'rule': rule,
+                            'segment': segment,
+                            'reason': reason
+                        })
+                else:
+                    for kind, value in segments:
+                        if kind == 'static':
+                            literals.update(value)
+
+        alphabet = _RouterDiagnosticAlphabet(literals)
+        for descriptor in descriptors:
+            if descriptor['segments'] is not None:
+                descriptor['language'] = _diagnostic_language(
+                    descriptor['segments'], alphabet)
+            else:
+                descriptor['language'] = None
+
+        known = [descriptor for descriptor in descriptors
+                 if descriptor['language'] is not None]
+        known_by_id = dict((descriptor['id'], descriptor)
+                           for descriptor in known)
+        shadowed = set()
+        conflicts = []
+
+        def chain_for(method):
+            methods = ('PROXY', 'HEAD', 'GET', 'ANY') if method == 'HEAD' \
+                else ('PROXY', method, 'ANY')
+            chain = []
+            for bucket in methods:
+                routes = [item for item in descriptors
+                          if item['method'] == bucket]
+                if not self.strict_order:
+                    chain.extend(item for item in routes if item['static'])
+                    chain.extend(item for item in routes if not item['static'])
+                else:
+                    chain.extend(routes)
+            return chain
+
+        def position(descriptor, chain):
+            for index, item in enumerate(chain):
+                if item['id'] == descriptor['id']:
+                    return index
+
+        for descriptor in known:
+            if descriptor['method'] == 'PROXY':
+                continue
+
+            check_methods = ('HEAD', 'GET') if descriptor['method'] == 'GET' \
+                else (descriptor['method'],)
+            if descriptor['method'] == 'ANY':
+                generic_method = _diagnostic_generic_method(
+                    set(item['method'] for item in descriptors))
+                check_methods = ((generic_method or 'GET'),)
+
+            fully_covered = True
+            witness_chain = None
+            for verb in check_methods:
+                chain = chain_for(verb)
+                index = position(descriptor, chain)
+                if index is None or any(item['language'] is None
+                                        for item in chain[:index]):
+                    fully_covered = False
+                    break
+                earlier = chain[:index]
+                cover = _diagnostic_union([item['language']
+                                           for item in earlier]) if earlier else None
+                if cover is None or not _diagnostic_covers(
+                        descriptor['language'], cover, alphabet):
+                    fully_covered = False
+                    break
+                witness_chain = chain
+
+            if not fully_covered:
+                continue
+
+            verb = 'GET' if descriptor['method'] == 'GET' else check_methods[0]
+            witness = _diagnostic_example(descriptor['language'], alphabet)
+            target, urlargs = self.match({
+                'PATH_INFO': witness,
+                'REQUEST_METHOD': verb
+            })
+            chain = witness_chain or chain_for(verb)
+            winner = next(item for item in chain[:position(descriptor, chain)]
+                          if item['target'] is target)
+            if target is not winner['target']:
+                continue
+            if descriptor['getargs']:
+                descriptor['getargs'](witness)
+
+            shadowed.add(descriptor['id'])
+            conflicts.append({
+                'type': 'shadowed',
+                'method': descriptor['method'],
+                'rule': descriptor['rule'],
+                'shadowed_rule': descriptor['rule'],
+                'winner': {
+                    'method': winner['method'],
+                    'rule': winner['rule']
+                },
+                'loser': {
+                    'method': descriptor['method'],
+                    'rule': descriptor['rule']
+                },
+                'witness': witness,
+                'witness_method': verb,
+                'witness_args': urlargs
+            })
+
+        def pair_method(first, second):
+            if first['method'] == 'PROXY':
+                method = second['method']
+            elif second['method'] == 'PROXY':
+                method = first['method']
+            elif first['method'] == second['method']:
+                method = first['method']
+            elif {first['method'], second['method']} == {'GET', 'HEAD'}:
+                method = 'HEAD'
+            elif 'ANY' in (first['method'], second['method']) and \
+                    'PROXY' not in (first['method'], second['method']):
+                method = next(item['method'] for item in (first, second)
+                              if item['method'] != 'ANY')
+            else:
+                return None
+
+            if method == 'ANY':
+                return _diagnostic_generic_method(
+                    set(item['method'] for item in descriptors))
+            return method
+
+        def winner_for(first, second, verb):
+            def rank(descriptor):
+                method = descriptor['method']
+                if method == 'PROXY':
+                    bucket_rank = 0
+                elif verb == 'HEAD' and method == 'HEAD':
+                    bucket_rank = 1
+                elif verb == 'HEAD' and method == 'GET':
+                    bucket_rank = 2
+                elif verb != 'HEAD' and method == verb:
+                    bucket_rank = 2
+                elif method == 'ANY':
+                    bucket_rank = 3
+                else:
+                    bucket_rank = 4
+                static_rank = 0 if descriptor['static'] and not self.strict_order else 1
+                return bucket_rank, static_rank, descriptor['id']
+
+            if rank(first) < rank(second):
+                return first, second
+            return second, first
+
+        for first_index, first in enumerate(known):
+            for second in known[first_index + 1:]:
+                verb = pair_method(first, second)
+                if verb is None:
+                    continue
+                winner, loser = winner_for(first, second, verb)
+                if loser['id'] in shadowed and \
+                        any(item['type'] == 'shadowed' and
+                            item['winner']['rule'] == winner['rule'] and
+                            item['loser']['rule'] == loser['rule']
+                            for item in conflicts):
+                    continue
+
+                chain = chain_for(verb)
+                previous = chain[:position(winner, chain)]
+                blockers = [item for item in previous
+                            if item['id'] != loser['id']]
+                if any(item['language'] is None for item in blockers):
+                    continue
+
+                blocker = _diagnostic_union([item['language']
+                                             for item in blockers]) \
+                    if blockers else None
+                witness = _diagnostic_intersection(
+                    first['language'], second['language'], alphabet, blocker)
+                if witness is None:
+                    continue
+
+                target, urlargs = self.match({
+                    'PATH_INFO': witness,
+                    'REQUEST_METHOD': verb
+                })
+                if target is not winner['target']:
+                    continue
+                if loser['getargs']:
+                    loser['getargs'](witness)
+
+                conflicts.append({
+                    'type': 'ambiguous',
+                    'method': verb,
+                    'winner': {
+                        'method': winner['method'],
+                        'rule': winner['rule']
+                    },
+                    'loser': {
+                        'method': loser['method'],
+                        'rule': loser['rule']
+                    },
+                    'rules': [first['rule'], second['rule']],
+                    'witness': witness,
+                    'witness_method': verb,
+                    'witness_args': urlargs
+                })
+
+        conflicts.sort(key=lambda item: (
+            item['type'],
+            _diagnostic_bucket_order(item['witness_method']),
+            item['witness_method'],
+            item['witness'],
+            item['loser']['rule'],
+            item['winner']['rule']
+        ))
+        unknown.sort(key=lambda item: (
+            _diagnostic_bucket_order(item['method']),
+            item['method'],
+            item['rule'],
+            item['segment']
+        ))
+        return {'conflicts': conflicts, 'unknown': unknown}
+
+    def route_diagnostics(self):
+        return self.diagnose_routes()
 
 
 class Route:
@@ -830,6 +1433,13 @@ class Bottle:
             tuple. The second value is a dictionary with parameters extracted
             from the URL. Raise :exc:`HTTPError` (404/405) on a non-match."""
         return self.router.match(environ)
+
+    def route_diagnostics(self):
+        """ Return a read-only route overlap report for this application. """
+        return self.router.route_diagnostics()
+
+    def diagnose_routes(self):
+        return self.router.diagnose_routes()
 
     def get_url(self, routename, **kargs):
         """ Return a string that matches a named route """
