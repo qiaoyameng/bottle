@@ -492,7 +492,10 @@ class Route:
         #: decorator are stored in this dictionary. Used for route-specific
         #: plugin configuration and meta-data.
         self.config = app.config._make_overlay()
+        upload_policy = config.pop('upload_policy', None)
         self.config.load_dict(config)
+        if upload_policy is not None:
+            self.config['upload_policy'] = UploadPolicy.coerce(upload_policy)
 
     @cached_property
     def call(self):
@@ -872,6 +875,8 @@ class Bottle:
               applied to the route callback in addition to installed plugins.
             :param skip: A list of plugins, plugin classes or names. Matching
               plugins are not installed to this route. ``True`` skips all.
+            :param upload_policy: An optional :class:`UploadPolicy` or mapping
+              with route-specific upload limits.
 
             Any additional keyword arguments are stored as route-specific
             configuration and passed to plugins (see :meth:`Plugin.apply`).
@@ -1110,6 +1115,136 @@ class Bottle:
 ###############################################################################
 
 
+class UploadPolicy:
+    """ Route-specific limits for reading and parsing upload requests. """
+
+    def __init__(
+        self,
+        max_request_bytes=None,
+        max_files=None,
+        max_file_bytes=None,
+        max_field_counts=None,
+        allowed_fields=None,
+        reject_unknown_fields=False,
+    ):
+        limits = {
+            'max_request_bytes': max_request_bytes,
+            'max_files': max_files,
+            'max_file_bytes': max_file_bytes,
+        }
+        for name, value in limits.items():
+            if value is not None and (not isinstance(value, int) or value < 0):
+                raise ValueError('%s must be a non-negative integer' % name)
+
+        if allowed_fields is not None:
+            allowed_fields = frozenset(allowed_fields)
+
+        normalized_counts = {}
+        for name, value in (max_field_counts or {}).items():
+            if not isinstance(value, int) or value < 0:
+                raise ValueError('Field limits must be non-negative integers')
+            normalized_counts[name] = value
+
+        self.max_request_bytes = max_request_bytes
+        self.max_files = max_files
+        self.max_file_bytes = max_file_bytes
+        self.max_field_counts = normalized_counts
+        self.allowed_fields = allowed_fields
+        if isinstance(reject_unknown_fields, str):
+            mode = reject_unknown_fields.lower()
+            if mode in ('reject', 'deny', 'strict'):
+                reject_unknown_fields = True
+            elif mode in ('count', 'allow', 'ignore'):
+                reject_unknown_fields = False
+            else:
+                raise ValueError('Unknown field policy must be reject/count')
+        self.reject_unknown_fields = bool(reject_unknown_fields)
+
+    def check_field(self, name, is_file, field_counts, file_count):
+        if self.reject_unknown_fields and self.allowed_fields is not None \
+                and name not in self.allowed_fields:
+            raise UploadPolicyError(400, 'Unknown upload field.',
+                                    reason='unknown_field')
+
+        if is_file and self.max_files is not None and file_count > self.max_files:
+            raise UploadPolicyError(413, 'Upload file count limit reached.',
+                                    reason='file_count')
+
+        limit = self.max_field_counts.get(name)
+        if limit is not None and field_counts[name] > limit:
+            raise UploadPolicyError(400, 'Upload field count limit reached.',
+                                    reason='field_count')
+
+    def check_file_size(self, size):
+        if self.max_file_bytes is not None and size > self.max_file_bytes:
+            raise UploadPolicyError(413, 'Upload file size limit reached.',
+                                    reason='file_bytes')
+
+    @classmethod
+    def coerce(cls, policy):
+        if policy is None or isinstance(policy, cls):
+            return policy
+        if isinstance(policy, dict):
+            aliases = {
+                'max_request_bytes': (
+                    'request_bytes', 'max_body_bytes', 'body_bytes',
+                    'max_request_size', 'max_total_bytes', 'max_read_bytes',
+                ),
+                'max_files': (
+                    'files', 'file_count', 'max_file_count',
+                    'max_upload_files', 'max_uploads', 'max_num_files',
+                ),
+                'max_file_bytes': (
+                    'file_bytes', 'max_upload_size', 'upload_size',
+                    'max_file_size', 'file_size',
+                ),
+                'max_field_counts': (
+                    'field_counts', 'field_limits', 'max_fields',
+                    'max_field_occurrences',
+                ),
+                'allowed_fields': (
+                    'fields', 'known_fields', 'allowed', 'allow_fields',
+                ),
+                'reject_unknown_fields': (
+                    'reject_unknown', 'unknown_fields_reject',
+                    'strict_fields', 'unknown_fields',
+                ),
+            }
+            values = dict(policy)
+            normalized = {}
+            for name, alternatives in aliases.items():
+                for key in (name,) + alternatives:
+                    if key in values:
+                        normalized[name] = values.pop(key)
+                        break
+            if values:
+                raise TypeError('Unknown upload policy options: %s' %
+                                ', '.join(sorted(values)))
+            unknown = normalized.pop('reject_unknown_fields', None)
+            allowed = normalized.get('allowed_fields')
+            if unknown is None:
+                unknown = allowed is not None
+            elif isinstance(unknown, str):
+                mode = unknown.lower()
+                if mode in ('reject', 'deny', 'strict'):
+                    unknown = True
+                elif mode in ('count', 'allow', 'ignore'):
+                    unknown = False
+                else:
+                    raise ValueError('Unknown field policy must be reject/count')
+            else:
+                unknown = bool(unknown)
+            if isinstance(normalized.get('allowed_fields'), dict):
+                allowed_fields = normalized.pop('allowed_fields')
+                normalized.setdefault('max_field_counts', allowed_fields)
+                allowed = None
+            normalized['reject_unknown_fields'] = unknown
+            return cls(**normalized)
+        if isinstance(policy, (list, tuple)):
+            return cls(allowed_fields=policy, reject_unknown_fields=True)
+        raise TypeError('Unsupported upload policy: %r' % (policy,))
+
+
 class BaseRequest:
     """ A wrapper for WSGI environment dictionaries that adds a lot of
         convenient access methods and properties. Most of them are read-only.
@@ -1267,10 +1402,23 @@ class BaseRequest:
             yield part
             maxread -= len(part)
 
+    def _iter_limited_body(self, read, bufsize):
+        read_bytes = 0
+        while True:
+            part = read(bufsize)
+            if not part:
+                break
+            read_bytes += len(part)
+            if read_bytes > self._upload_read_limit():
+                raise UploadPolicyError(413, 'Request upload limit reached.',
+                                        reason='request_bytes')
+            yield part
+
     @staticmethod
-    def _iter_chunked(read, bufsize):
+    def _iter_chunked(read, bufsize, max_bytes=None):
         err = HTTPError(400, 'Error while parsing chunked transfer body.')
         rn, sem, bs = b'\r\n', b';', b''
+        read_bytes = 0
         while True:
             header = read(1)
             while header[-2:] != rn:
@@ -1287,13 +1435,49 @@ class BaseRequest:
             buff = bs
             while maxread > 0:
                 if not buff:
-                    buff = read(min(maxread, bufsize))
+                    read_size = min(maxread, bufsize)
+                    if max_bytes is not None:
+                        read_size = min(read_size, max_bytes - read_bytes + 1)
+                    buff = read(read_size)
                 part, buff = buff[:maxread], buff[maxread:]
                 if not part: raise err
                 yield part
+                read_bytes += len(part)
+                if max_bytes is not None and read_bytes > max_bytes:
+                    raise UploadPolicyError(413,
+                                            'Request upload limit reached.',
+                                            reason='request_bytes')
                 maxread -= len(part)
             if read(2) != rn:
                 raise err
+
+    def _upload_policy(self):
+        policy = self.environ.get('bottle.request.upload_policy', _UNSET)
+        if policy is _UNSET:
+            configured = None
+            try:
+                configured = self.route.config.get('upload_policy')
+                if configured is None:
+                    configured = self.app.config.get('upload.policy')
+            except RuntimeError:
+                try:
+                    configured = self.app.config.get('upload.policy')
+                except RuntimeError:
+                    configured = None
+            policy = UploadPolicy.coerce(configured)
+            self.environ['bottle.request.upload_policy'] = policy
+        return policy
+
+    def _upload_read_limit(self):
+        policy = self._upload_policy()
+        if policy and policy.max_request_bytes is not None:
+            return policy.max_request_bytes
+        return None
+
+    def _request_bufsize(self, read_limit=None):
+        if read_limit is not None:
+            return max(1, min(self.MEMFILE_MAX, read_limit + 1))
+        return self.MEMFILE_MAX
 
     @DictProperty('environ', 'bottle.request.body', read_only=True)
     def _body(self):
@@ -1302,28 +1486,57 @@ class BaseRequest:
         except KeyError:
             self.environ['wsgi.input'] = BytesIO()
             return self.environ['wsgi.input']
-        body_iter = self._iter_chunked if self.chunked else self._iter_body
+        read_limit = self._upload_read_limit()
+        if read_limit is not None and self.content_length > read_limit:
+            raise UploadPolicyError(413, 'Request upload limit reached.',
+                                    reason='request_bytes')
+
+        if self.chunked:
+            body_iter = functools.partial(self._iter_chunked,
+                                          max_bytes=read_limit)
+        elif read_limit is not None and self.content_length < 0:
+            body_iter = self._iter_limited_body
+        else:
+            body_iter = self._iter_body
         body, body_size, is_temp_file = BytesIO(), 0, False
-        for part in body_iter(read_func, self.MEMFILE_MAX):
-            body.write(part)
-            body_size += len(part)
-            if not is_temp_file and body_size > self.MEMFILE_MAX:
-                body, tmp = NamedTemporaryFile(mode='w+b'), body
-                body.write(tmp.getvalue())
-                del tmp
-                is_temp_file = True
+        try:
+            for part in body_iter(read_func, self._request_bufsize(read_limit)):
+                body.write(part)
+                body_size += len(part)
+                if not is_temp_file and body_size > self.MEMFILE_MAX:
+                    body, tmp = NamedTemporaryFile(mode='w+b'), body
+                    body.write(tmp.getvalue())
+                    del tmp
+                    is_temp_file = True
+                    self.environ['bottle.request.body.tempfile'] = True
+        except Exception:
+            if is_temp_file:
+                _try_close(body)
+            raise
         self.environ['wsgi.input'] = body
         body.seek(0)
         return body
 
+    def _close_body_tempfile(self):
+        body = self.environ.get('bottle.request.body')
+        if self.environ.pop('bottle.request.body.tempfile', False):
+            _try_close(body)
+
     def _get_body_string(self, maxread):
         """ Read body into a string. Raise HTTPError(413) on requests that are
             too large. """
+        error_type = UploadPolicyError if self._upload_policy() else HTTPError
         if self.content_length > maxread:
-            raise HTTPError(413, 'Request entity too large')
+            if error_type is UploadPolicyError:
+                raise error_type(413, 'Request upload limit reached.',
+                                 reason='request_bytes')
+            raise error_type(413, 'Request entity too large')
         data = self.body.read(maxread + 1)
         if len(data) > maxread:
-            raise HTTPError(413, 'Request entity too large')
+            if error_type is UploadPolicyError:
+                raise error_type(413, 'Request upload limit reached.',
+                                 reason='request_bytes')
+            raise error_type(413, 'Request entity too large')
         return data
 
     @property
@@ -1357,25 +1570,52 @@ class BaseRequest:
         # We default to application/x-www-form-urlencoded for everything that
         # is not multipart and take the fast path (also: 3.1 workaround)
         if not content_type.startswith('multipart/'):
-            body = self._get_body_string(self.MEMFILE_MAX).decode('utf8', 'surrogateescape')
-            for key, value in _parse_qsl(body, 'utf8'):
-                post[key] = value
+            read_limit = self._upload_read_limit()
+            body_limit = read_limit if read_limit is not None else self.MEMFILE_MAX
+            policy = self._upload_policy()
+            field_counts = {}
+            try:
+                body = self._get_body_string(body_limit)
+                for key, value in _parse_qsl(
+                        body.decode('utf8', 'surrogateescape'), 'utf8'):
+                    field_counts[key] = field_counts.get(key, 0) + 1
+                    if policy:
+                        policy.check_field(key, False, field_counts, 0)
+                    post[key] = value
+            except Exception:
+                self._close_body_tempfile()
+                raise
             return post
 
         charset = options.get("charset", "utf8")
         boundary = options.get("boundary")
         if not boundary:
             raise MultipartError("Invalid content type header, missing boundary")
-        parser = _MultipartParser(self.body, boundary, self.content_length,
-            mem_limit=self.MEMFILE_MAX, memfile_limit=self.MEMFILE_MAX,
-            charset=charset)
+        policy = self._upload_policy()
+        request_limit = policy.max_request_bytes if policy else None
+        disk_limit = request_limit if request_limit is not None else 2 ** 30
+        parser = _MultipartParser(self.body, boundary,
+            -1 if policy else self.content_length,
+            disk_limit=disk_limit,
+            mem_limit=min(self.MEMFILE_MAX, disk_limit),
+            memfile_limit=self.MEMFILE_MAX,
+            line_buffer_size=2 ** 16,
+            charset=charset, upload_policy=policy)
 
-        for part in parser.parse():
-            if not part.filename and part.is_buffered():
-                post[part.name] = part.value
-            else:
-                post[part.name] = FileUpload(part.file, part.name,
-                                            part.filename, part.headerlist)
+        parts = []
+        try:
+            for part in parser.parse():
+                parts.append(part)
+                if not part.filename and part.is_buffered():
+                    post[part.name] = part.value
+                else:
+                    post[part.name] = FileUpload(part.file, part.name,
+                                                part.filename, part.headerlist)
+        except Exception:
+            for part in parts:
+                part.close()
+            self._close_body_tempfile()
+            raise
 
         return post
 
@@ -1942,6 +2182,13 @@ class HTTPError(HTTPResponse):
         self.exception = exception
         self.traceback = traceback
         super(HTTPError, self).__init__(body, status, **more_headers)
+
+
+class UploadPolicyError(HTTPError):
+    def __init__(self, status, body, reason, exception=None, traceback=None):
+        super().__init__(status, body, exception, traceback,
+                         **{'X-Upload-Error': reason})
+        self.reason = reason
 
 ###############################################################################
 # Plugins ######################################################################
@@ -3135,7 +3382,9 @@ class _MultipartParser:
         mem_limit=2 ** 20,
         memfile_limit=2 ** 18,
         buffer_size=2 ** 16,
+        line_buffer_size=None,
         charset="latin1",
+        upload_policy=None,
     ):
         self.stream = stream
         self.boundary = boundary
@@ -3143,8 +3392,9 @@ class _MultipartParser:
         self.disk_limit = disk_limit
         self.memfile_limit = memfile_limit
         self.mem_limit = min(mem_limit, self.disk_limit)
-        self.buffer_size = min(buffer_size, self.mem_limit)
+        self.buffer_size = line_buffer_size or min(buffer_size, self.mem_limit)
         self.charset = charset
+        self.upload_policy = upload_policy
 
         if not boundary:
             raise MultipartError("No boundary.")
@@ -3197,6 +3447,8 @@ class _MultipartParser:
         terminator = separator + b"--"
         mem_used, disk_used = 0, 0  # Track used resources to prevent DoS
         is_tail = False  # True if the last line was incomplete (cutted)
+        field_counts = {}
+        file_count = 0
 
         # Consume first boundary. Ignore any preamble, as required by RFC
         # 2046, section 5.1.1.
@@ -3216,12 +3468,25 @@ class _MultipartParser:
             "buffer_size": self.buffer_size,
             "memfile_limit": self.memfile_limit,
             "charset": self.charset,
+            "upload_policy": self.upload_policy,
         }
         part = _MultipartPart(**part_options)
 
         for line, nl in lines:
             if not is_tail and (line == separator or line == terminator):
-                part.finish()
+                try:
+                    part.finish()
+                    if self.upload_policy:
+                        is_file = part.filename is not None
+                        field_counts[part.name] = (
+                            field_counts.get(part.name, 0) + 1)
+                        file_count += 1 if is_file else 0
+                        self.upload_policy.check_file_size(part.size)
+                        self.upload_policy.check_field(
+                            part.name, is_file, field_counts, file_count)
+                except Exception:
+                    part.close()
+                    raise
                 if part.is_buffered():
                     mem_used += part.size
                 else:
@@ -3239,7 +3504,7 @@ class _MultipartParser:
                             raise MultipartError("Memory limit reached.")
                     elif part.size + disk_used > self.disk_limit:
                         raise MultipartError("Disk limit reached.")
-                except MultipartError:
+                except Exception:
                     part.close()
                     raise
         else:
@@ -3250,7 +3515,8 @@ class _MultipartParser:
 
 
 class _MultipartPart:
-    def __init__(self, buffer_size=2 ** 16, memfile_limit=2 ** 18, charset="latin1"):
+    def __init__(self, buffer_size=2 ** 16, memfile_limit=2 ** 18,
+                 charset="latin1", upload_policy=None):
         self.headerlist = []
         self.headers = None
         self.file = False
@@ -3263,6 +3529,7 @@ class _MultipartPart:
         self.charset = charset
         self.memfile_limit = memfile_limit
         self.buffer_size = buffer_size
+        self.upload_policy = upload_policy
 
     def feed(self, line, nl=""):
         if self.file:
@@ -3292,6 +3559,8 @@ class _MultipartPart:
             return  # This does not even flush the buffer
 
         self.size += len(line) + len(self._buf)
+        if self.upload_policy:
+            self.upload_policy.check_file_size(self.size)
         self.file.write(self._buf + line)
         self._buf = nl
 
@@ -3329,6 +3598,10 @@ class _MultipartPart:
         self.charset = options.get("charset") or self.charset
 
         self.content_length = int(self.headers.get("Content-Length", "-1"))
+        if self.upload_policy:
+            self.upload_policy.check_field(
+                self.name, self.filename is not None, {self.name: 1},
+                1 if self.filename is not None else 0)
 
     def finish(self):
         if not self.file:
