@@ -850,7 +850,7 @@ class Bottle:
               callback=None,
               name=None,
               apply=None,
-              skip=None, **config):
+              skip=None, upload=None, **config):
         """ A decorator to bind a function to a request URL. Example::
 
                 @app.route('/hello/<name>')
@@ -872,6 +872,11 @@ class Bottle:
               applied to the route callback in addition to installed plugins.
             :param skip: A list of plugins, plugin classes or names. Matching
               plugins are not installed to this route. ``True`` skips all.
+            :param upload: An optional :class:`UploadPolicy` that limits how
+              request bodies (form fields and file uploads) are parsed for
+              this route. The policy is stored as route config under the
+              ``upload_policy`` key and enforced while
+              :attr:`Request.forms`/:attr:`Request.files` are parsed.
 
             Any additional keyword arguments are stored as route-specific
             configuration and passed to plugins (see :meth:`Plugin.apply`).
@@ -879,6 +884,8 @@ class Bottle:
         if callable(path): path, callback = None, path
         plugins = makelist(apply)
         skiplist = makelist(skip)
+        if upload is not None:
+            config['upload_policy'] = upload
 
         def decorator(callback):
             if isinstance(callback, str):
@@ -1110,6 +1117,37 @@ class Bottle:
 ###############################################################################
 
 
+class _LimitedInput:
+    """ File-like wrapper around a WSGI ``wsgi.input`` stream that counts the
+        bytes actually read and raises :class:`RequestSizeExceeded` once more
+        than ``limit`` bytes were requested. A read of exactly ``limit`` bytes
+        succeeds; the budget is exceeded only by the (limit+1)-th byte.
+    """
+
+    def __init__(self, stream, limit):
+        self.stream = stream
+        self.limit = limit
+        self.remaining = limit + 1
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = self.remaining
+        if size > self.remaining:
+            size = self.remaining
+        data = self.stream.read(size)
+        self.remaining -= len(data)
+        if self.remaining <= 0:
+            # The (limit+1)-th byte was actually returned by the socket
+            # layer, so the client exceeded the budget.
+            raise RequestSizeExceeded(self.limit, self.limit + 1)
+        return data
+
+    def close(self):
+        close = getattr(self.stream, 'close', None)
+        if close is not None:
+            return close()
+
+
 class BaseRequest:
     """ A wrapper for WSGI environment dictionaries that adds a lot of
         convenient access methods and properties. Most of them are read-only.
@@ -1162,6 +1200,15 @@ class BaseRequest:
         """ A :class:`WSGIHeaderDict` that provides case-insensitive access to
             HTTP request headers. """
         return WSGIHeaderDict(self.environ)
+
+    @DictProperty('environ', 'bottle.request.upload_policy', read_only=True)
+    def upload_policy(self):
+        """ The :class:`UploadPolicy` attached to the matched route, or ``None``
+            if the route (or the request) has no policy configured. """
+        route = self.environ.get('bottle.route')
+        if route is not None:
+            return route.config.get('upload_policy')
+        return None
 
     def get_header(self, name, default=None):
         """ Return the value of a request header, or a given default value. """
@@ -1267,6 +1314,16 @@ class BaseRequest:
             yield part
             maxread -= len(part)
 
+    def _iter_body_eof(self, read, bufsize):
+        """ Read until the underlying stream signals EOF. Used when the real
+            body length is unknown (missing Content-Length or chunked
+            encoding without a declared length). The stream wrapper itself
+            enforces the read budget. """
+        while True:
+            part = read(bufsize)
+            if not part: break
+            yield part
+
     @staticmethod
     def _iter_chunked(read, bufsize):
         err = HTTPError(400, 'Error while parsing chunked transfer body.')
@@ -1298,20 +1355,39 @@ class BaseRequest:
     @DictProperty('environ', 'bottle.request.body', read_only=True)
     def _body(self):
         try:
-            read_func = self.environ['wsgi.input'].read
+            raw_input = self.environ['wsgi.input']
         except KeyError:
             self.environ['wsgi.input'] = BytesIO()
             return self.environ['wsgi.input']
+        policy = self.upload_policy
+        memfile_max = (policy.memfile_max if policy is not None
+                      else self.MEMFILE_MAX)
+        read_func = raw_input.read
+        if policy is not None and policy.max_request_bytes is not None:
+            # Count bytes actually handed over by the socket layer. This works
+            # regardless of Content-Length or Transfer-Encoding and therefore
+            # cannot be bypassed by missing or forged headers.
+            raw_input = _LimitedInput(raw_input, policy.max_request_bytes)
+            self.environ['wsgi.input'] = raw_input
+            read_func = raw_input.read
         body_iter = self._iter_chunked if self.chunked else self._iter_body
+        if (not self.chunked and policy is not None
+                and policy.max_request_bytes is not None
+                and self.content_length < 0):
+            body_iter = self._iter_body_eof
         body, body_size, is_temp_file = BytesIO(), 0, False
-        for part in body_iter(read_func, self.MEMFILE_MAX):
-            body.write(part)
-            body_size += len(part)
-            if not is_temp_file and body_size > self.MEMFILE_MAX:
-                body, tmp = NamedTemporaryFile(mode='w+b'), body
-                body.write(tmp.getvalue())
-                del tmp
-                is_temp_file = True
+        try:
+            for part in body_iter(read_func, memfile_max):
+                body.write(part)
+                body_size += len(part)
+                if not is_temp_file and body_size > memfile_max:
+                    body, tmp = NamedTemporaryFile(mode='w+b'), body
+                    body.write(tmp.getvalue())
+                    del tmp
+                    is_temp_file = True
+        except Exception:
+            body.close()
+            raise
         self.environ['wsgi.input'] = body
         body.seek(0)
         return body
@@ -1357,8 +1433,13 @@ class BaseRequest:
         # We default to application/x-www-form-urlencoded for everything that
         # is not multipart and take the fast path (also: 3.1 workaround)
         if not content_type.startswith('multipart/'):
-            body = self._get_body_string(self.MEMFILE_MAX).decode('utf8', 'surrogateescape')
-            for key, value in _parse_qsl(body, 'utf8'):
+            body_limit = self.MEMFILE_MAX
+            policy = self.upload_policy
+            if policy is not None and policy.max_request_bytes is not None:
+                body_limit = policy.max_request_bytes
+            data = self._get_body_string(body_limit)
+            for key, value in _parse_qsl(
+                    data.decode('utf8', 'surrogateescape'), 'utf8'):
                 post[key] = value
             return post
 
@@ -1366,16 +1447,38 @@ class BaseRequest:
         boundary = options.get("boundary")
         if not boundary:
             raise MultipartError("Invalid content type header, missing boundary")
+        policy = self.upload_policy
+        memfile_max = (policy.memfile_max if policy is not None
+                      else self.MEMFILE_MAX)
+        parser_kwargs = dict(
+            memfile_limit=memfile_max, charset=charset)
+        if policy is not None:
+            parser_kwargs['policy'] = policy
         parser = _MultipartParser(self.body, boundary, self.content_length,
-            mem_limit=self.MEMFILE_MAX, memfile_limit=self.MEMFILE_MAX,
-            charset=charset)
+                                  **parser_kwargs)
 
-        for part in parser.parse():
-            if not part.filename and part.is_buffered():
-                post[part.name] = part.value
-            else:
-                post[part.name] = FileUpload(part.file, part.name,
-                                            part.filename, part.headerlist)
+        file_uploads = []
+        try:
+            for part in parser.parse():
+                if not part.filename and part.is_buffered():
+                    post[part.name] = part.value
+                else:
+                    upload = FileUpload(part.file, part.name,
+                                        part.filename, part.headerlist)
+                    file_uploads.append(upload)
+                    post[part.name] = upload
+        except Exception:
+            # Never hand half-parsed forms to the callback: close every temp
+            # file created so far and drop the spooled request body.
+            for upload in file_uploads:
+                upload.file.close()
+            self.environ.pop('bottle.request.post', None)
+            self.environ.pop('bottle.request.forms', None)
+            self.environ.pop('bottle.request.files', None)
+            body = self.environ.get('bottle.request.body')
+            if body is not None:
+                body.close()
+            raise
 
         return post
 
@@ -3125,6 +3228,118 @@ class MultipartError(HTTPError):
         HTTPError.__init__(self, 400, "MultipartError: " + msg)
 
 
+class UploadPolicyError(HTTPError):
+    """ Base class for errors raised when an upload policy is violated.
+        All subclasses are :class:`HTTPError` exceptions and therefore abort
+        the request before the route callback is called. """
+
+    def __init__(self, code, msg):
+        HTTPError.__init__(self, code, msg)
+
+
+class RequestSizeExceeded(UploadPolicyError):
+    """ The request body exceeded the total number of bytes that were allowed
+        to be read from the socket. """
+    def __init__(self, limit, actual=None):
+        msg = "Request exceeds maximum size of %d bytes." % limit
+        if actual is not None:
+            msg += " (%d bytes read)" % actual
+        UploadPolicyError.__init__(self, 413, msg)
+        self.limit = limit
+        self.actual = actual
+
+
+class FileSizeExceeded(UploadPolicyError):
+    """ A single uploaded file exceeded its per-file size limit. """
+    def __init__(self, name, limit, actual=None):
+        msg = ('Uploaded file "%s" exceeds maximum size of %d bytes.'
+               % (name, limit))
+        if actual is not None:
+            msg += " (%d bytes)" % actual
+        UploadPolicyError.__init__(self, 413, msg)
+        self.field_name = name
+        self.limit = limit
+        self.actual = actual
+
+
+class FileCountExceeded(UploadPolicyError):
+    """ The number of uploaded files exceeded the policy limit. """
+    def __init__(self, limit):
+        UploadPolicyError.__init__(
+            self, 400,
+            "Too many uploaded files (limit: %d)." % limit)
+        self.limit = limit
+
+
+class FieldCountExceeded(UploadPolicyError):
+    """ A form field appeared more often than allowed by the policy. """
+    def __init__(self, name, limit):
+        UploadPolicyError.__init__(
+            self, 400,
+            'Form field "%s" appears more than %d time(s).' % (name, limit))
+        self.field_name = name
+        self.limit = limit
+
+
+class UnknownFieldError(UploadPolicyError):
+    """ A form field appeared that is not listed in the upload policy and the
+        policy rejects unknown fields. """
+    def __init__(self, name):
+        UploadPolicyError.__init__(
+            self, 400, 'Unknown form field "%s".' % name)
+        self.field_name = name
+
+
+class UploadPolicy:
+    """ Per-route policy that limits how a request body is parsed.
+
+        Attach an instance to a route via the ``upload`` keyword argument of
+        :meth:`Bottle.route` (and its shortcuts)::
+
+            @app.post('/avatar', upload=UploadPolicy(
+                max_request_bytes=64 * 1024,
+                max_files=1,
+                max_file_bytes=64 * 1024))
+            def avatar():
+                ...
+
+        All limits are enforced during lazy parsing of :attr:`Request.forms`
+        and :attr:`Request.files`, so accessing these properties inside the
+        callback is covered. Byte limits count data actually read from the
+        socket and therefore cannot be bypassed by a missing or forged
+        ``Content-Length`` header. A value exactly equal to a limit is accepted.
+
+        :param max_request_bytes: Maximum number of bytes read from the request
+            body (all form values and files combined). ``None`` disables the
+            limit.
+        :param max_files: Maximum number of uploaded files (parts carrying a
+            filename). ``None`` disables the limit.
+        :param max_file_bytes: Maximum size in bytes of a single uploaded
+            file. ``None`` disables the limit.
+        :param field_limits: Mapping of field names to the maximum number of
+            times the field may appear in the form. Counts both regular form
+            values and file uploads.
+        :param reject_unknown: If ``True``, any field not listed in
+            ``field_limits`` is rejected. If ``False`` (the default), unknown
+            fields are accepted and their bytes still count towards
+            ``max_request_bytes``.
+        :param memfile_max: Parts smaller than this are buffered in memory,
+            larger parts spill to temporary files on disk. Defaults to
+            :attr:`BaseRequest.MEMFILE_MAX`.
+    """
+
+    def __init__(self, max_request_bytes=None, max_files=None,
+                 max_file_bytes=None, field_limits=None,
+                 reject_unknown=False, memfile_max=None):
+        self.max_request_bytes = max_request_bytes
+        self.max_files = max_files
+        self.max_file_bytes = max_file_bytes
+        self.field_limits = dict(field_limits) if field_limits else {}
+        self.reject_unknown = reject_unknown
+        self.memfile_max = (memfile_max if memfile_max is not None
+                            else BaseRequest.MEMFILE_MAX)
+
+
 class _MultipartParser:
     def __init__(
         self,
@@ -3136,6 +3351,7 @@ class _MultipartParser:
         memfile_limit=2 ** 18,
         buffer_size=2 ** 16,
         charset="latin1",
+        policy=None,
     ):
         self.stream = stream
         self.boundary = boundary
@@ -3145,6 +3361,7 @@ class _MultipartParser:
         self.mem_limit = min(mem_limit, self.disk_limit)
         self.buffer_size = min(buffer_size, self.mem_limit)
         self.charset = charset
+        self.policy = policy
 
         if not boundary:
             raise MultipartError("No boundary.")
@@ -3218,28 +3435,67 @@ class _MultipartParser:
             "charset": self.charset,
         }
         part = _MultipartPart(**part_options)
+        part.checked = False
 
+        def begin_part(part):
+            """ Enforce field occurrence, file count and unknown-field limits
+                as soon as the part header has been parsed. """
+            if part.checked:
+                return
+            part.checked = True
+            if self.policy is None:
+                return
+            name = part.name
+            field_counts[name] = field_counts.get(name, 0) + 1
+            limit = self.policy.field_limits.get(name)
+            if limit is not None and field_counts[name] > limit:
+                raise FieldCountExceeded(name, limit)
+            if (self.policy.reject_unknown
+                    and name not in self.policy.field_limits):
+                raise UnknownFieldError(name)
+            if part.filename is not None:
+                file_count[0] += 1
+                if (self.policy.max_files is not None
+                        and file_count[0] > self.policy.max_files):
+                    raise FileCountExceeded(self.policy.max_files)
+
+        field_counts = {}
+        file_count = [0]
         for line, nl in lines:
             if not is_tail and (line == separator or line == terminator):
-                part.finish()
-                if part.is_buffered():
-                    mem_used += part.size
-                else:
-                    disk_used += part.size
+                try:
+                    begin_part(part)
+                    part.finish()
+                    if part.is_buffered():
+                        mem_used += part.size
+                    else:
+                        disk_used += part.size
+                except (MultipartError, UploadPolicyError):
+                    part.close()
+                    raise
                 yield part
                 if line == terminator:
                     break
                 part = _MultipartPart(**part_options)
+                part.checked = False
             else:
                 is_tail = not nl  # The next line continues this one
                 try:
+                    if part.headers is not None:
+                        begin_part(part)
                     part.feed(line, nl)
                     if part.is_buffered():
                         if part.size + mem_used > self.mem_limit:
                             raise MultipartError("Memory limit reached.")
                     elif part.size + disk_used > self.disk_limit:
                         raise MultipartError("Disk limit reached.")
-                except MultipartError:
+                    if (self.policy is not None
+                            and self.policy.max_file_bytes is not None
+                            and part.filename is not None
+                            and part.size > self.policy.max_file_bytes):
+                        raise FileSizeExceeded(
+                            part.name, self.policy.max_file_bytes, part.size)
+                except (MultipartError, UploadPolicyError):
                     part.close()
                     raise
         else:

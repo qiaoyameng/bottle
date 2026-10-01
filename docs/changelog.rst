@@ -54,6 +54,7 @@ Release 0.14 (in development)
 .. rubric:: New features
 
 * ``bottle.HTTPError`` raised on invalid JSON now include the underlying exception in the ``exception`` field.
+* Routes accept an optional ``upload=UploadPolicy(...)`` keyword to enforce per-route upload limits (total bytes actually read from the request body, number of files, per-file bytes and per-field occurrence counts). Limits are applied while ``request.forms``/``request.files`` are parsed lazily, do not rely on ``Content-Length`` and therefore also work with missing headers or chunked transfer coding. Violations raise distinguishable client errors (413/400), close all temporary files created so far and never expose a half-parsed form to the route callback. Routes without an :class:`UploadPolicy` keep the previous :attr:`BaseRequest.MEMFILE_MAX` behavior.
 
 
 Release 0.13
@@ -272,4 +273,3 @@ This is an incomplete list of new features and improved functionality.
 * New :func:`get`, :func:`post`, :func:`put` and :func:`delete` decorators.
 * The :class:`SimpleTemplate` engine got full unicode support.
 * Lots of non-critical bugfixes.
-
