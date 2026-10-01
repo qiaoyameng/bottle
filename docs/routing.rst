@@ -92,6 +92,86 @@ Old Syntax          New Syntax
 Try to avoid the old syntax in future projects if you can. It is not currently deprecated, but will be eventually.
 
 
+Host routing
+--------------------------------------------------------------------------------
+
+Sometimes the same path has to be served by different callbacks depending on
+the request host, e.g. for multi-tenant applications. Instead of inspecting
+``request.headers['Host']`` inside your callbacks, you can bind routes to a
+host rule via the ``host`` parameter::
+
+    @app.route('/reports/<id>', host='<tenant>.example.com')
+    def reports(tenant, id):
+        return 'Report %s for tenant %s' % (id, tenant)
+
+    @app.route('/reports/<id>')
+    def reports_fallback(id):
+        return 'Report %s' % id
+
+The host rule supports the same wildcard syntax (including filters) as path
+rules, but only the new ``<name>`` / ``<name:filter>`` syntax. A host wildcard
+name must not be reused by a path wildcard of the same route; doing so raises
+a :class:`RouteNameClashError` at registration time.
+
+Host normalization
+^^^^^^^^^^^^^^^^^^
+
+To make matching predictable, request hosts and host rules are normalized
+before they are compared:
+
+* Host names are matched case-insensitively (``Example.COM`` equals
+  ``example.com``).
+* International domain names are converted to their IDNA/punycode form, so
+  ``bücher.example`` and ``xn--bcher-kva.example`` are equivalent.
+* IPv6 literals are compressed into their canonical form (``[2001:DB8::1]``
+  equals ``[2001:db8:0:0::1]``).
+* The default ports ``80`` (for ``http``) and ``443`` (for ``https``) are
+  ignored, so a single rule never matches the same logical host twice.
+  Explicit non-default ports are kept.
+
+A syntactically invalid ``Host`` header results in ``400 Bad Request``.
+
+Proxy headers
+^^^^^^^^^^^^^
+
+Only the WSGI ``HTTP_HOST`` variable is used by default. If your application
+runs behind a trusted proxy that sets ``X-Forwarded-Host``, you have to opt in
+explicitly before that header is trusted::
+
+    app.config['router.trust_proxy_headers'] = True
+
+When enabled, the left-most (original) host in ``X-Forwarded-Host`` is used.
+
+Matching order
+^^^^^^^^^^^^^^
+
+If several rules match a request, the first match wins with the following
+fixed priority (independent of dictionary order); within each group, the rule
+registered first wins:
+
+#. Static host, static path
+#. Static host, dynamic path
+#. Dynamic host, static path
+#. Dynamic host, dynamic path
+#. No host rule, static path
+#. No host rule, dynamic path
+
+Thus, host-specific rules always take precedence over host-independent ones,
+but a host-independent rule still matches if no host-specific rule does.
+
+Building URLs for host routes
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Named routes with a host rule build network-path URLs (starting with ``//``)
+when you pass the host wildcard values::
+
+    app.get_url('reports', tenant='acme', id=1)
+    # '//acme.example.com/reports/1'
+
+Host wildcard values are IDNA encoded and percent-escaped for the host
+component, while path wildcard values use path escaping (slashes are kept
+within path values but encoded within host labels).
+
 
 Explicit routing configuration
 --------------------------------------------------------------------------------

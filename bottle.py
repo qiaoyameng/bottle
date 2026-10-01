@@ -97,6 +97,7 @@ import configparser
 from datetime import timezone
 UTC = timezone.utc
 import inspect
+import ipaddress
 
 json_loads = lambda s: json_lds(touni(s))
 callable = lambda x: hasattr(x, '__call__')
@@ -249,6 +250,10 @@ class RouteBuildError(RouteError):
     """ The route could not be built. """
 
 
+class RouteNameClashError(RouteSyntaxError):
+    """ A host wildcard and a path wildcard share the same name. """
+
+
 def _re_flatten(p):
     """ Turn all capturing groups in a regular expression pattern into
         non-capturing groups. """
@@ -268,22 +273,63 @@ class Router:
         The path-rule is either a static path (e.g. `/contact`) or a dynamic
         path that contains wildcards (e.g. `/wiki/<page>`). The wildcard syntax
         and details on the matching order are described in docs:`routing`.
+
+        A route may additionally be bound to a host-rule via the ``host``
+        parameter. The host-rule is either a fully qualified host name (e.g.
+        ``example.com``) or a pattern containing wildcards (e.g.
+        ``<tenant>.example.com``). Host rules follow the same wildcard syntax
+        as path rules, including filters.
+
+        If multiple rules match the same request, they are selected in the
+        following order (first match wins, first registration wins within each
+        group):
+
+        1. Rules with a static host rule, static path
+        2. Rules with a static host rule, dynamic path
+        3. Rules with a dynamic host rule, static path
+        4. Rules with a dynamic host rule, dynamic path
+        5. Rules without a host rule, static path
+        6. Rules without a host rule, dynamic path
+
+        Host names are normalized before matching: Upper case letters are
+        folded to lower case, international domain names are converted to their
+        IDNA (punycode) form, IPv6 literals are compressed into their canonical
+        form, and the default port of the request scheme (``http`` -> 80,
+        ``https`` -> 443) is removed so that ``example.com`` and
+        ``example.com:80`` never produce two different matches.
+
+        The ``HTTP_HOST`` WSGI variable is the only source of the request host.
+        The ``X-Forwarded-Host`` header is consulted only when
+        ``trust_proxy_headers`` is enabled explicitly, in which case the
+        left-most (original) host is used.
     """
 
     default_pattern = '[^/]+'
     default_filter = 're'
+    default_host_pattern = '[^.:/]+'
 
     #: The current CPython regexp implementation does not allow more
     #: than 99 matching groups per regular expression.
     _MAX_GROUPS_PER_PATTERN = 99
 
-    def __init__(self, strict=False):
+    def __init__(self, strict=False, trust_proxy_headers=False):
         self.rules = []  # All rules in order
         self._groups = {}  # index of regexes to find them in dyna_routes
         self.builder = {}  # Data structure for the url builder
-        self.static = {}  # Search structure for static routes
-        self.dyna_routes = {}
-        self.dyna_regexes = {}  # Search structure for dynamic routes
+        self.static = {}  # Search structure for host-less static routes
+        self.dyna_routes = {}  # Host-less dynamic routes
+        self.dyna_regexes = {}  # Search structure for host-less dynamic routes
+        #: Search structure for routes with a fully static host rule.
+        #: method -> host -> {'static': {path: entry},
+        #:                   'dyna_routes': [entry], 'dyna_regexes': [...]}
+        self.host_static = {}
+        #: Ordered list of (method, host_pattern, scope) for dynamic hosts.
+        self.host_dyna = {}
+        self._host_groups = {}  # (flatpat_host, method) -> index in host_dyna
+        #: True if at least one host-scoped rule was registered.
+        self.has_host_routes = False
+        #: Read X-Forwarded-Host instead of HTTP_HOST when true.
+        self.trust_proxy_headers = trust_proxy_headers
         #: If true, static routes are no longer checked first.
         self.strict_order = strict
         self.filters = {
@@ -300,10 +346,193 @@ class Router:
         The first element is a string, the last two are callables or None. """
         self.filters[name] = func
 
+    _invalid_host_chars = re.compile(r'[\s\\/\"\@\!\#\$\%\^\&\*\(\)\;\,\?\=\{\}\|\<\>\[\]]')
+    _host_label_chars = re.compile(r'^[a-z0-9_\-]+$')
+
+    @staticmethod
+    def _idna_encode_label(label):
+        """ Lower-case and IDNA encode a single DNS label. """
+        try:
+            return label.encode('idna').decode('ascii')
+        except UnicodeError:
+            raise RouteSyntaxError("Invalid host name label: %r" % label)
+
+    def _idna_encode_hostname(self, hostname, register=False):
+        """ Lower-case and IDNA encode a (possibly dotted) host name. """
+        if not hostname:
+            raise RouteSyntaxError("Invalid host name: empty.") \
+                if register else HTTPError(400, 'Invalid host name: empty.')
+        labels = hostname.rstrip('.').split('.')
+        result = []
+        for label in labels:
+            if not label:
+                raise RouteSyntaxError("Invalid host name: empty label.") \
+                    if register else HTTPError(
+                        400, 'Invalid host name: empty label.')
+            label = label.lower()
+            if self._host_label_chars.match(label):
+                result.append(label)
+            else:
+                try:
+                    result.append(self._idna_encode_label(label))
+                except RouteSyntaxError:
+                    if register:
+                        raise
+                    raise HTTPError(400, 'Invalid host name.')
+        return '.'.join(result)
+
+    def _normalize_host_template(self, host):
+        """ Normalize a fully static host rule. Returns the canonical
+            ``host[:port]`` form or ``[ipv6]``/``[ipv6]:port`` form. """
+        host = host.strip().lower()
+        if not host:
+            raise RouteSyntaxError("Host rule must not be empty.")
+        if host.startswith('['):
+            bracket = host.find(']')
+            if bracket < 0:
+                raise RouteSyntaxError("Missing ']' in IPv6 host rule: %r" % host)
+            try:
+                ip = ipaddress.IPv6Address(host[1:bracket])
+            except ValueError:
+                raise RouteSyntaxError("Invalid IPv6 address in host rule: %r" % host)
+            tail = host[bracket + 1:]
+            if tail and not re.match(r'^:\d+$', tail):
+                raise RouteSyntaxError("Invalid host rule: %r" % host)
+            if tail and int(tail[1:]) in (80, 443):
+                tail = ''
+            return '[%s]%s' % (ip.compressed, tail)
+        if ':' in host:
+            hostname, port = host.rsplit(':', 1)
+            if not port.isdigit() or not 0 <= int(port) <= 65535:
+                raise RouteSyntaxError("Invalid port in host rule: %r" % host)
+            if int(port) in (80, 443):
+                return self._idna_encode_hostname(
+                    hostname, register=True).rstrip('.')
+            return '%s:%s' % (
+                self._idna_encode_hostname(hostname, register=True), int(port))
+        return self._idna_encode_hostname(host, register=True).rstrip('.')
+
+    def _normalize_dynamic_host(self, host):
+        """ Normalize the literal parts of a host rule containing wildcards.
+            Literal text is lower-cased; non-ASCII characters in labels that
+            also contain wildcards are rejected because they cannot be IDNA
+            encoded separately. """
+        def host_label(label):
+            lowered = label.lower()
+            if self.host_rule_syntax.search(lowered):
+                # Label contains a wildcard: only ASCII literal text is
+                # allowed, it cannot be IDNA encoded separately.
+                for token in self.host_rule_syntax.finditer(lowered):
+                    literal = (lowered[:token.start()] + lowered[token.end():])
+                    try:
+                        literal.encode('ascii')
+                    except UnicodeEncodeError:
+                        raise RouteSyntaxError(
+                            "Non-ASCII characters cannot share a host label"
+                            " with a wildcard: %r" % host)
+                return lowered
+            return self._idna_encode_hostname(lowered, register=True)
+
+        def dns_part(part):
+            return '.'.join(host_label(label) for label in part.split('.'))
+
+        if host.startswith('['):
+            bracket = host.find(']')
+            if bracket < 0:
+                raise RouteSyntaxError(
+                    "Missing ']' in IPv6 host rule: %r" % host)
+            out = ['[', dns_part(host[1:bracket]), ']']
+            rest = host[bracket + 1:]
+            if rest.startswith(':') and not rest[1:2].isdigit():
+                out.append(':')
+                rest = rest[1:]
+            out.append(dns_part(rest))
+        else:
+            out = [dns_part(host)]
+        return ''.join(out)
+
+    @staticmethod
+    def _default_ports(scheme):
+        return {'http': (80,), 'https': (443,)}.get((scheme or 'http').lower(), ())
+
+    def _request_host(self, environ):
+        """ Extract and normalize the request host from the WSGI environ.
+            Returns a canonical ``host[:port]`` string or raises HTTPError(400)
+            for an invalid Host header. """
+        raw = None
+        if self.trust_proxy_headers:
+            forwarded = environ.get('HTTP_X_FORWARDED_HOST')
+            if forwarded:
+                raw = forwarded.split(',')[0].strip()
+        if not raw:
+            raw = environ.get('HTTP_HOST')
+        if not raw:
+            raw = environ.get('SERVER_NAME')
+        if not raw:
+            return None
+        raw = raw.strip()
+        try:
+            if raw.startswith('['):
+                bracket = raw.find(']')
+                if bracket < 0:
+                    raise ValueError
+                ip = ipaddress.IPv6Address(raw[1:bracket])
+                tail = raw[bracket + 1:]
+                port = None
+                if tail:
+                    if not tail.startswith(':'):
+                        raise ValueError
+                    port = int(tail[1:])
+                    if not 0 <= port <= 65535:
+                        raise ValueError
+                if port is not None and port not in self._default_ports(
+                        environ.get('wsgi.url_scheme')):
+                    return '[%s]:%d' % (ip.compressed, port)
+                return '[%s]' % ip.compressed
+            if self._invalid_host_chars.search(raw):
+                raise ValueError
+            if raw.count(':') == 1:
+                hostname, port_text = raw.rsplit(':', 1)
+                port = int(port_text)
+                if not 0 <= port <= 65535:
+                    raise ValueError
+                hostname = self._idna_encode_hostname(hostname)
+                if port not in self._default_ports(environ.get('wsgi.url_scheme')):
+                    return '%s:%d' % (hostname, port)
+                return hostname
+            if ':' in raw:
+                raise ValueError  # bare (unbracketed) IPv6 literal
+            return self._idna_encode_hostname(raw)
+        except (ValueError, UnicodeError):
+            raise HTTPError(400, 'Invalid host header: %r' % raw)
+
     rule_syntax = re.compile('(\\\\*)'
         '(?:(?::([a-zA-Z_][a-zA-Z_0-9]*)?()(?:#(.*?)#)?)'
           '|(?:<([a-zA-Z_][a-zA-Z_0-9]*)?(?::([a-zA-Z_]*)'
             '(?::((?:\\\\.|[^\\\\>])+)?)?)?>))')
+
+    #: Host rules only support the new ``<name>`` wildcard syntax so that
+    #: colons in IPv6 literals and port separators are not confused with the
+    #: deprecated ``:name`` path wildcard syntax.
+    host_rule_syntax = re.compile(
+        r'(\\*)<([a-zA-Z_][a-zA-Z_0-9]*)?(?::([a-zA-Z_]*)'
+        r'(?::((?:\\.|[^\\>])+)?)?)?>')
+
+    def _iterhosttokens(self, rule):
+        offset, prefix = 0, ''
+        for match in self.host_rule_syntax.finditer(rule):
+            prefix += rule[offset:match.start()]
+            g = match.groups()
+            if len(g[0]) % 2:  # Escaped wildcard
+                prefix += match.group(0)[len(g[0]):]
+                offset = match.end()
+                continue
+            if prefix:
+                yield prefix, None, None
+            yield g[1], g[2] or 'default', g[3] or None
+            offset, prefix = match.end(), ''
+        if offset <= len(rule) or prefix:
+            yield prefix + rule[offset:], None, None
 
     def _itertokens(self, rule):
         offset, prefix = 0, ''
@@ -326,85 +555,74 @@ class Router:
         if offset <= len(rule) or prefix:
             yield prefix + rule[offset:], None, None
 
-    def add(self, rule, method, target, name=None):
-        """ Add a new rule or replace the target for an existing rule. """
-        anons = []  # Generated names of anonymous wildcards
-        keys = []  # Names of keys
-        pattern = ''  # Regular expression pattern with named groups
-        filters = []  # Lists of wildcard input filters
-        builder = []  # Data structure for the URL builder
+
+    def _parse_rule(self, rule, is_host, anons, tokenizer=None):
+        """ Parse a host or path rule into a (pattern, filters, builder,
+            keys, is_static) tuple. ``anons`` is shared between host and path
+            rules of the same route so that anonymous wildcards do not clash.
+        """
+        tokenizer = tokenizer or self._itertokens
+        keys = []
+        pattern = ''
+        filters = []
+        builder = []
         is_static = True
 
-        for key, mode, conf in self._itertokens(rule):
+        for key, mode, conf in tokenizer(rule):
             if mode:
                 is_static = False
-                if mode == 'default': mode = self.default_filter
+                if mode == 'default':
+                    mode = self.default_filter
                 mask, in_filter, out_filter = self.filters[mode](conf)
+                if is_host and mode == 're' and not conf:
+                    mask = self.default_host_pattern
                 if not key:
                     key = 'anon%d' % len(anons)
                     anons.append(key)
                 pattern += '(?P<%s>%s)' % (key, mask)
                 keys.append(key)
-                if in_filter: filters.append((key, in_filter))
+                if in_filter:
+                    filters.append((key, in_filter))
                 builder.append((key, out_filter or str))
             elif key:
                 pattern += re.escape(key)
                 builder.append((None, key))
 
-        self.builder[rule] = builder
-        if name: self.builder[name] = builder
+        return pattern, filters, builder, keys, is_static
 
-        if is_static and not self.strict_order:
-            self.static.setdefault(method, {})
-            self.static[method][self.build(rule)] = (target, None)
-            return
-
-        try:
-            re_pattern = re.compile('^(%s)$' % pattern)
-            re_match = re_pattern.match
-        except re.error as e:
-            raise RouteSyntaxError("Could not add Route: %s (%s)" % (rule, e))
-
+    def _make_getargs(self, re_pattern, filters, anons):
+        re_match = re_pattern.match
         if filters:
 
-            def getargs(path):
-                url_args = re_match(path).groupdict()
+            def getargs(value):
+                url_args = re_match(value).groupdict()
                 for name, wildcard_filter in filters:
                     try:
                         url_args[name] = wildcard_filter(url_args[name])
                     except ValueError:
-                        raise HTTPError(400, 'Path has wrong format.')
+                        raise HTTPError(400, 'Value has wrong format.')
                 for key in anons:
-                    del url_args[key]
+                    url_args.pop(key, None)
                 return url_args
         elif re_pattern.groupindex:
 
-            def getargs(path):
-                url_args = re_match(path).groupdict()
+            def getargs(value):
+                url_args = re_match(value).groupdict()
                 for key in anons:
-                    del url_args[key]
+                    url_args.pop(key, None)
                 return url_args
         else:
             getargs = None
+        return getargs
 
-        flatpat = _re_flatten(pattern)
-        whole_rule = (rule, flatpat, target, getargs)
+    @staticmethod
+    def _new_scope():
+        return {'static': {}, 'dyna_routes': [],
+                'dyna_regexes': [], '_groups': {}}
 
-        if (flatpat, method) in self._groups:
-            if DEBUG:
-                msg = 'Route <%s %s> overwrites a previously defined route'
-                warnings.warn(msg % (method, rule), RuntimeWarning, stacklevel=3)
-            self.dyna_routes[method][
-                self._groups[flatpat, method]] = whole_rule
-        else:
-            self.dyna_routes.setdefault(method, []).append(whole_rule)
-            self._groups[flatpat, method] = len(self.dyna_routes[method]) - 1
-
-        self._compile(method)
-
-    def _compile(self, method):
-        all_rules = self.dyna_routes[method]
-        comborules = self.dyna_regexes[method] = []
+    def _compile_scope(self, scope):
+        all_rules = scope['dyna_routes']
+        comborules = scope['dyna_regexes'] = []
         maxgroups = self._MAX_GROUPS_PER_PATTERN
         for x in range(0, len(all_rules), maxgroups):
             some = all_rules[x:x + maxgroups]
@@ -414,55 +632,365 @@ class Router:
             rules = [(target, getargs) for (_, _, target, getargs) in some]
             comborules.append((combined, rules))
 
+    def _compile(self, method):
+        scope = {'dyna_routes': self.dyna_routes[method], 'dyna_regexes': []}
+        self._compile_scope(scope)
+        self.dyna_regexes[method] = scope['dyna_regexes']
+
+    def add(self, rule, method, target, name=None, host=None):
+        """ Add a new rule or replace the target for an existing rule.
+
+            If ``host`` is given, the route additionally matches a host rule
+            (e.g. ``example.com`` or ``<tenant>.example.com``).
+        """
+        if host is not None and not str(host).strip():
+            raise RouteSyntaxError("Host rule must not be empty.")
+        anons = []
+
+        host_builder = None
+        host_is_static = True
+        if host:
+            self.has_host_routes = True
+            host_is_static = not any(mode for _, mode, _
+                                     in self._iterhosttokens(host))
+            if host_is_static:
+                host_key = self._normalize_host_template(host)
+                host_builder = [(None, host_key)]
+                host_getargs = host_re = None
+            else:
+                host_norm = self._normalize_dynamic_host(host)
+                host_pattern, host_filters, host_builder, host_keys, \
+                    host_is_static = self._parse_rule(
+                        host_norm, True, anons, self._iterhosttokens)
+                try:
+                    host_re = re.compile('^(%s)$' % host_pattern)
+                except re.error as e:
+                    raise RouteSyntaxError(
+                        "Could not add host rule: %s (%s)" % (host, e))
+                host_re_match = host_re.match
+                host_getargs = self._make_getargs(
+                    host_re, host_filters, anons)
+                host_key = _re_flatten(host_pattern)
+
+        pattern, filters, path_builder, path_keys, path_is_static = \
+            self._parse_rule(rule, False, anons)
+
+        path_key_set = set(path_keys)
+        if host:
+            host_key_names = set(host_re.groupindex) if not host_is_static \
+                else set()
+            clash = path_key_set & host_key_names
+            if clash:
+                raise RouteNameClashError(
+                    "Host and path wildcards share a name: %s"
+                    % ', '.join(sorted(clash)))
+
+        # Host-less routes keep their original (legacy) storage structures.
+        if not host:
+            self.builder[rule] = path_builder
+            if name:
+                self.builder[name] = path_builder
+            if path_is_static and not self.strict_order:
+                self.static.setdefault(method, {})
+                self.static[method][''.join(
+                    f for (_, f) in path_builder)] = (target, None)
+                return
+
+            try:
+                re_pattern = re.compile('^(%s)$' % pattern)
+            except re.error as e:
+                raise RouteSyntaxError(
+                    "Could not add Route: %s (%s)" % (rule, e))
+            getargs = self._make_getargs(re_pattern, filters, anons)
+
+            flatpat = _re_flatten(pattern)
+            whole_rule = (rule, flatpat, target, getargs)
+
+            if (flatpat, method) in self._groups:
+                if DEBUG:
+                    msg = 'Route <%s %s> overwrites a previously defined route'
+                    warnings.warn(msg % (method, rule), RuntimeWarning,
+                                  stacklevel=3)
+                self.dyna_routes[method][
+                    self._groups[flatpat, method]] = whole_rule
+            else:
+                self.dyna_routes.setdefault(method, []).append(whole_rule)
+                self._groups[flatpat, method] = \
+                    len(self.dyna_routes[method]) - 1
+
+            self._compile(method)
+            return
+
+        # Host-scoped routes.
+        entry = (host_builder, path_builder)
+        self.builder[(host, rule)] = entry
+        if name:
+            self.builder[name] = entry
+
+        if path_is_static:
+            static_path = ''.join(f for (_, f) in path_builder)
+
+        if host_is_static:
+            scope = self.host_static.setdefault(method, {}) \
+                .setdefault(host_key, self._new_scope())
+            if path_is_static:
+                scope['static'][static_path] = (target, None)
+                return
+            try:
+                re_pattern = re.compile('^(%s)$' % pattern)
+            except re.error as e:
+                raise RouteSyntaxError(
+                    "Could not add Route: %s (%s)" % (rule, e))
+            getargs = self._make_getargs(re_pattern, filters, anons)
+            flatpat = _re_flatten(pattern)
+            if flatpat in scope['_groups']:
+                if DEBUG:
+                    msg = 'Route <%s %s %s> overwrites a previously' \
+                          ' defined route'
+                    warnings.warn(msg % (method, host, rule),
+                                  RuntimeWarning, stacklevel=3)
+                scope['dyna_routes'][scope['_groups'][flatpat]] = (
+                    rule, flatpat, target, getargs)
+            else:
+                scope['_groups'][flatpat] = len(scope['dyna_routes'])
+                scope['dyna_routes'].append(
+                    (rule, flatpat, target, getargs))
+            self._compile_scope(scope)
+            return
+
+        # Dynamic host rule.
+        bucket = self.host_dyna.get(method)
+        if bucket is None:
+            bucket = []
+            self.host_dyna[method] = bucket
+        group_id = self._host_groups.get((host_key, method))
+        if group_id is None:
+            group_id = len(bucket)
+            self._host_groups[(host_key, method)] = group_id
+            scope = self._new_scope()
+            bucket.append((host_key, host_re_match, host_getargs,
+                           host_builder, scope))
+        else:
+            _, host_re_match, host_getargs, _, scope = bucket[group_id]
+
+        if path_is_static:
+            scope['static'][static_path] = (target, None)
+        else:
+            try:
+                re_pattern = re.compile('^(%s)$' % pattern)
+            except re.error as e:
+                raise RouteSyntaxError(
+                    "Could not add Route: %s (%s)" % (rule, e))
+            getargs = self._make_getargs(re_pattern, filters, anons)
+            flatpat = _re_flatten(pattern)
+            if flatpat in scope['_groups']:
+                if DEBUG:
+                    msg = 'Route <%s %s %s> overwrites a previously' \
+                          ' defined route'
+                    warnings.warn(msg % (method, host, rule),
+                                  RuntimeWarning, stacklevel=3)
+                scope['dyna_routes'][scope['_groups'][flatpat]] = (
+                    rule, flatpat, target, getargs)
+            else:
+                scope['_groups'][flatpat] = len(scope['dyna_routes'])
+                scope['dyna_routes'].append(
+                    (rule, flatpat, target, getargs))
+            self._compile_scope(scope)
+
+    def _match_scope(self, scope, path):
+        if path in scope['static']:
+            return scope['static'][path]
+        for combined, rules in scope['dyna_regexes']:
+            match = combined(path)
+            if match:
+                return rules[match.lastindex - 1]
+        return None
+
+    def _match_hostless(self, method, path):
+        if method in self.static and path in self.static[method]:
+            return self.static[method][path]
+        if method in self.dyna_regexes:
+            for combined, rules in self.dyna_regexes[method]:
+                match = combined(path)
+                if match:
+                    return rules[match.lastindex - 1]
+        return None
+
     def build(self, _name, *anons, **query):
-        """ Build an URL by filling the wildcards in a rule. """
-        builder = self.builder.get(_name)
-        if not builder:
+        """ Build an URL by filling the wildcards in a rule.
+
+            For host-scoped routes the result is a network-path reference
+            starting with ``//`` (e.g. ``//example.com/reports/1``). Host
+            wildcards are IDNA encoded and percent-escaped with an empty safe
+            set, while path wildcards follow the usual path escaping rules.
+        """
+        entry = self.builder.get(_name)
+        if not entry:
             raise RouteBuildError("No route with that name.", _name)
+
+        if isinstance(entry, tuple) and len(entry) == 2 and \
+                isinstance(entry[0], list):
+            host_builder, path_builder = entry
+        else:
+            host_builder, path_builder = None, entry
+
         try:
             for i, value in enumerate(anons):
                 query['anon%d' % i] = value
-            url = ''.join([f(query.pop(n)) if n else f for (n, f) in builder])
+
+            host_parts = []
+            inside_brackets = False
+            for name, func in host_builder or []:
+                if name:
+                    value = self._host_value_to_url(func(query.pop(name)))
+                    try:
+                        ipaddress.IPv6Address(value)
+                        if not inside_brackets:
+                            value = '[%s]' % value
+                    except ValueError:
+                        pass
+                    host_parts.append(value)
+                else:
+                    host_parts.append(func)
+                    inside_brackets = (func.count('[') - func.count(']')
+                                       + (1 if inside_brackets else 0)) > 0
+
+            path_parts = []
+            for name, func in path_builder:
+                if name:
+                    path_parts.append(urlquote(
+                        func(query.pop(name)), safe="/:@!$&'()*+,;=~"))
+                else:
+                    path_parts.append(func)
+
+            url = ''.join(path_parts)
+            if host_parts:
+                url = '//' + ''.join(host_parts) + url
             return url if not query else url + '?' + urlencode(query, doseq=True)
         except KeyError as E:
             raise RouteBuildError('Missing URL argument: %r' % E.args[0])
 
+    def _host_value_to_url(self, value):
+        """ Convert a host wildcard value into a URL-safe host label.
+            Non-ASCII values are IDNA encoded, everything else is
+            percent-escaped with an empty safe set (so dots in a wildcard
+            value are preserved while slashes and spaces are encoded).
+            IPv6 literals are returned in compressed form without brackets;
+            the caller adds brackets when needed. """
+        value = str(value)
+        try:
+            ipaddress.IPv6Address(value)
+            return ipaddress.IPv6Address(value).compressed
+        except ValueError:
+            pass
+        if value.startswith('['):
+            bracket = value.find(']')
+            try:
+                ipaddress.IPv6Address(value[1:bracket])
+                tail = value[bracket + 1:]
+                if tail and not re.match(r'^:\d+$', tail):
+                    raise ValueError
+                return value
+            except ValueError:
+                pass
+
+        def quote_label(label):
+            if self._host_label_chars.match(label):
+                return label
+            try:
+                label.encode('ascii')
+                raise RouteSyntaxError('bad label')
+            except UnicodeEncodeError:
+                return self._idna_encode_label(label)
+            except RouteSyntaxError:
+                return urlquote(label, safe='')
+
+        parts = []
+        for label in value.split('.'):
+            if ':' in label:
+                hostname, sep, port = label.partition(':')
+                parts.append(quote_label(hostname) + sep +
+                             urlquote(port, safe=''))
+            else:
+                parts.append(quote_label(label))
+        return '.'.join(parts)
+
     def match(self, environ):
-        """ Return a (target, url_args) tuple or raise HTTPError(400/404/405). """
+        """ Return a (target, url_args) tuple or raise HTTPError(400/404/405).
+        """
         verb = environ['REQUEST_METHOD'].upper()
         path = environ['PATH_INFO'] or '/'
 
-        methods = ('PROXY', 'HEAD', 'GET', 'ANY') if verb == 'HEAD' else ('PROXY', verb, 'ANY')
+        methods = ('PROXY', 'HEAD', 'GET', 'ANY') if verb == 'HEAD' \
+            else ('PROXY', verb, 'ANY')
+
+        request_host = None
+        if self.has_host_routes:
+            request_host = self._request_host(environ)
+
+        def resolve(entry, host_match=None):
+            target, getargs = entry
+            args = {}
+            if host_match is not None:
+                args.update(host_match(request_host) or {})
+            if getargs:
+                args.update(getargs(path))
+            return target, args
+
+        def host_static_hit(method):
+            if not request_host or method not in self.host_static:
+                return None
+            scope = self.host_static[method].get(request_host)
+            if not scope:
+                return None
+            return self._match_scope(scope, path)
+
+        def host_dyna_hit(method):
+            if not request_host or method not in self.host_dyna:
+                return None
+            for _, host_match, host_getargs, _, scope in \
+                    self.host_dyna[method]:
+                if host_match(request_host):
+                    entry = self._match_scope(scope, path)
+                    if entry:
+                        return entry, host_getargs
+            return None
 
         for method in methods:
-            if method in self.static and path in self.static[method]:
-                target, getargs = self.static[method][path]
-                return target, getargs(path) if getargs else {}
-            elif method in self.dyna_regexes:
-                for combined, rules in self.dyna_regexes[method]:
-                    match = combined(path)
-                    if match:
-                        target, getargs = rules[match.lastindex - 1]
-                        return target, getargs(path) if getargs else {}
+            entry = host_static_hit(method)
+            if entry:
+                return resolve(entry)
+            hit = host_dyna_hit(method)
+            if hit:
+                entry, host_match = hit
+                return resolve(entry, host_match)
+            entry = self._match_hostless(method, path)
+            if entry:
+                return resolve(entry)
 
         # No matching route found. Collect alternative methods for 405 response
-        allowed = set([])
+        allowed = set()
         nocheck = set(methods)
-        for method in set(self.static) - nocheck:
-            if path in self.static[method]:
+
+        def path_matches(method):
+            entry = host_static_hit(method)
+            if entry:
+                return True
+            if host_dyna_hit(method):
+                return True
+            return self._match_hostless(method, path) is not None
+
+        all_methods = (set(self.static) | set(self.dyna_regexes)
+                       | set(self.host_static) | set(self.host_dyna))
+        for method in all_methods - nocheck:
+            if path_matches(method):
                 allowed.add(method)
-        for method in set(self.dyna_regexes) - allowed - nocheck:
-            for combined, rules in self.dyna_regexes[method]:
-                match = combined(path)
-                if match:
-                    allowed.add(method)
+
         if allowed:
             allow_header = ",".join(sorted(allowed))
             raise HTTPError(405, "Method not allowed.", Allow=allow_header)
 
-        # No matching route and no alternative method found. We give up
         raise HTTPError(404, "Not found: " + repr(path))
-
 
 class Route:
     """ This class wraps a route callback along with route specific metadata and
@@ -473,11 +1001,14 @@ class Route:
     def __init__(self, app, rule, method, callback,
                  name=None,
                  plugins=None,
-                 skiplist=None, **config):
+                 skiplist=None, host=None, **config):
         #: The application this route is installed to.
         self.app = app
         #: The path-rule string (e.g. ``/wiki/<page>``).
         self.rule = rule
+        #: The host-rule string (e.g. ``example.com`` or ``<t>.example.com``)
+        #: or ``None`` for host-independent routes.
+        self.host = host
         #: The HTTP method as a string (e.g. ``GET``).
         self.method = method
         #: The original callback with no plugins applied. Useful for introspection.
@@ -571,8 +1102,10 @@ class Route:
 
     def __repr__(self):
         cb = self.get_undecorated_callback()
-        return '<%s %s -> %s:%s>' % (
-            self.method, self.rule, cb.__module__, getattr(cb, '__name__', '?')
+        host = ('%s ' % self.host) if self.host else ''
+        return '<%s %s%s -> %s:%s>' % (
+            self.method, host, self.rule, cb.__module__,
+            getattr(cb, '__name__', '?')
         )
 
 ###############################################################################
@@ -593,6 +1126,7 @@ class Bottle:
     def _global_config(cls):
         cfg = ConfigDict()
         cfg.meta_set('catchall', 'validate', bool)
+        cfg.meta_set('router.trust_proxy_headers', 'validate', bool)
         return cfg
 
     def __init__(self, **kwargs):
@@ -602,7 +1136,8 @@ class Bottle:
             functools.partial(self.trigger_hook, 'config'))
 
         self.config.update({
-            "catchall": True
+            "catchall": True,
+            "router.trust_proxy_headers": False
         })
 
         if kwargs.get('catchall') is False:
@@ -622,7 +1157,9 @@ class Bottle:
         self.resources = ResourceManager()
 
         self.routes = []  # List of installed :class:`Route` instances.
-        self.router = Router()  # Maps requests to :class:`Route` instances.
+        self.router = Router(trust_proxy_headers=self.config.get(
+            'router.trust_proxy_headers', False))
+        self.config._add_change_listener(self._on_config_change)
         self.error_handler = {}
 
         # Core plugins
@@ -666,6 +1203,10 @@ class Bottle:
         """ Trigger a hook and return a list of results. """
         return [hook(*args, **kwargs) for hook in self._hooks[__name][:]]
 
+
+    def _on_config_change(self, config, key, value):
+        if key == 'router.trust_proxy_headers':
+            self.router.trust_proxy_headers = bool(value)
     def hook(self, name):
         """ Return a decorator that attaches a callback to a hook. See
             :meth:`add_hook` for details."""
@@ -833,15 +1374,19 @@ class Bottle:
 
     def get_url(self, routename, **kargs):
         """ Return a string that matches a named route """
+        location = self.router.build(routename, **kargs)
+        if location.startswith('//'):
+            return location
         scriptname = request.environ.get('SCRIPT_NAME', '').strip('/') + '/'
-        location = self.router.build(routename, **kargs).lstrip('/')
+        location = location.lstrip('/')
         return urljoin(urljoin('/', scriptname), location)
 
     def add_route(self, route):
         """ Add a route object, but do not change the :data:`Route.app`
             attribute."""
         self.routes.append(route)
-        self.router.add(route.rule, route.method, route, name=route.name)
+        self.router.add(route.rule, route.method, route, name=route.name,
+                        host=route.host)
         if DEBUG: route.prepare()
 
     def route(self,
@@ -850,7 +1395,7 @@ class Bottle:
               callback=None,
               name=None,
               apply=None,
-              skip=None, **config):
+              skip=None, host=None, **config):
         """ A decorator to bind a function to a request URL. Example::
 
                 @app.route('/hello/<name>')
@@ -868,6 +1413,13 @@ class Bottle:
             :param callback: An optional shortcut to avoid the decorator
               syntax. ``route(..., callback=func)`` equals ``route(...)(func)``
             :param name: The name for this route. (default: None)
+            :param host: An optional host rule. If set, the route only matches
+              requests for this host. The rule may contain wildcards just like
+              path rules (e.g. ``<tenant>.example.com``). Host names are
+              matched case-insensitively, international domain names and IPv6
+              literals are normalized, and default ports (80/443) are ignored.
+              Named routes with a host rule build absolute network-path URLs
+              (e.g. ``//tenant.example.com/reports/1``).
             :param apply: A decorator or plugin or a list of plugins. These are
               applied to the route callback in addition to installed plugins.
             :param skip: A list of plugins, plugin classes or names. Matching
@@ -889,7 +1441,7 @@ class Bottle:
                     route = Route(self, rule, verb, callback,
                                   name=name,
                                   plugins=plugins,
-                                  skiplist=skiplist, **config)
+                                  skiplist=skiplist, host=host, **config)
                     self.add_route(route)
             return callback
 

@@ -54,6 +54,7 @@ Release 0.14 (in development)
 .. rubric:: New features
 
 * ``bottle.HTTPError`` raised on invalid JSON now include the underlying exception in the ``exception`` field.
+* Routes can now be bound to a host rule via the ``host`` parameter of :meth:`Bottle.route` / :meth:`Router.add`. Host rules support the same named wildcards and filters as path rules (e.g. ``host='<tenant>.example.com'``). Host names are matched case-insensitively, international domain names are IDNA normalized, IPv6 literals are canonicalized, and default ports (80/443) are ignored. Host and path wildcards sharing a name raise :class:`RouteNameClashError` at registration time. Named host routes build network-path URLs (``//host/path``). The ``X-Forwarded-Host`` header is only consulted when ``router.trust_proxy_headers`` is enabled.
 
 
 Release 0.13
@@ -272,4 +273,3 @@ This is an incomplete list of new features and improved functionality.
 * New :func:`get`, :func:`post`, :func:`put` and :func:`delete` decorators.
 * The :class:`SimpleTemplate` engine got full unicode support.
 * Lots of non-critical bugfixes.
-
