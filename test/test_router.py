@@ -161,6 +161,97 @@ class TestRouter(unittest.TestCase):
             self.add('/<:>/'+str(i), str(i), 'GET')
         self.assertEqual(self.match('/foo/'+str(n-1))[0], str(n-1))
 
+    def reports(self):
+        return {(report['winner'], report['loser']): report
+                for report in self.r.route_diagnostics()
+                if report['status'] != 'unknown'}
+
+    def assertReport(self, winner, loser, method, witness, expected_target,
+                     status='ambiguous'):
+        report = self.reports()[(winner, loser)]
+        self.assertEqual(status, report['status'])
+        self.assertEqual(method, report['method'])
+        self.assertEqual(witness, report['witness'])
+        matched_target, args = self.match(witness, method)
+        self.assertEqual(expected_target, matched_target)
+        return report
+
+    def test_route_diagnostics_static_shadow(self):
+        self.add('/files/<name>', 'dynamic')
+        self.add('/files/settings', 'static')
+        report = self.assertReport('/files/settings', '/files/<name>',
+                                   'GET', '/files/settings', 'static')
+        self.assertEqual(['/files/settings', '/files/<name>'], report['rules'])
+
+    def test_route_diagnostics_numeric_filters_intersect(self):
+        self.add('/items/<id:int>', 'integer')
+        self.add('/items/<id:float>', 'floating')
+        self.assertReport('/items/<id:int>', '/items/<id:float>',
+                          'GET', '/items/00', 'integer')
+
+    def test_route_diagnostics_path_filter_intersection(self):
+        self.add('/files/<name>', 'name')
+        self.add('/files/<path:path>', 'path')
+        self.assertReport('/files/<name>', '/files/<path:path>',
+                          'GET', '/files/-', 'name')
+
+    def test_builtin_str_filter(self):
+        self.assertMatches('/files/<name:str>', '/files/report',
+                           name='report')
+
+    def test_route_diagnostics_head_fallback(self):
+        self.add('/shared/<name>', 'get', 'GET')
+        self.add('/shared/<name>', 'head', 'HEAD')
+        self.assertReport('/shared/<name>', '/shared/<name>',
+                          'HEAD', '/shared/-', 'head', 'shadowed')
+        self.assertEqual(['GET', 'HEAD'],
+                         self.reports()[('/shared/<name>',
+                                         '/shared/<name>')]['methods'])
+
+    def test_route_diagnostics_ignores_disjoint_methods(self):
+        self.add('/shared/<name>', 'get', 'GET')
+        self.add('/shared/<name>', 'post', 'POST')
+        self.assertEqual({}, self.reports())
+
+    def test_route_diagnostics_unknown_custom_rules(self):
+        self.add('/known/<name>', 'known')
+        self.add('/custom/<name:re:[a-z]+>', 'regular-expression')
+        self.r.add_filter('digits', lambda conf: (r'\d+', int, str))
+        self.add('/filtered/<name:digits>', 'custom-filter')
+        unknown = [report for report in self.r.route_diagnostics()
+                   if report['status'] == 'unknown']
+        self.assertEqual(
+            ['/custom/<name:re:[a-z]+>', '/filtered/<name:digits>'],
+            [report['rule'] for report in unknown])
+        self.assertEqual(
+            ['<name:re:[a-z]+>', '<name:digits>'],
+            [report['segment'] for report in unknown])
+
+    def test_route_diagnostics_is_stable_and_read_only(self):
+        self.add('/files/<name>', 'name')
+        self.add('/files/<path:path>', 'path')
+        before = self.r.route_diagnostics()
+        routes_before = (dict(self.r.static), self.r.dyna_routes.copy())
+        after = self.r.route_diagnostics()
+        self.assertEqual(before, after)
+        self.assertEqual(routes_before,
+                         (dict(self.r.static), self.r.dyna_routes.copy()))
+
+    def test_bottle_exposes_route_diagnostics(self):
+        app = bottle.Bottle()
+
+        @app.route('/files/<name>')
+        def name(name):
+            return name
+
+        @app.route('/files/<path:path>')
+        def path(path):
+            return path
+
+        report = app.route_diagnostics()[0]
+        self.assertEqual('/files/<name>', report['winner'])
+        self.assertEqual('/files/<path:path>', report['loser'])
+
 class TestRouterInCGIMode(TestRouter):
     ''' Makes no sense since the default route does not optimize CGI anymore.'''
     CGI = True

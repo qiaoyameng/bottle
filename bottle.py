@@ -258,6 +258,405 @@ def _re_flatten(p):
                   len(m.group(1)) % 2 else m.group(1) + '(?:', p)
 
 
+class _RouteLanguage:
+    __slots__ = ('epsilon', 'edges', 'start', 'accept', 'symbols')
+
+    def __init__(self):
+        self.epsilon = [set()]
+        self.edges = [[]]
+        self.start = 0
+        self.accept = 0
+        self.symbols = set()
+
+    def state(self):
+        index = len(self.edges)
+        self.epsilon.append(set())
+        self.edges.append([])
+        return index
+
+    def link(self, source, target, predicate=None):
+        if predicate is None:
+            self.epsilon[source].add(target)
+        else:
+            kind, value = predicate
+            if kind == 'char':
+                self.symbols.add(value)
+            self.edges[source].append((predicate, target))
+
+
+class _RouteDiagnostics:
+    @staticmethod
+    def _language(tokens):
+        language = _RouteLanguage()
+        tail = language.start
+
+        def add_literal(text):
+            nonlocal tail
+            for char in text:
+                state = language.state()
+                language.link(tail, state, ('char', char))
+                tail = state
+
+        def add_kind(kind):
+            nonlocal tail
+            start = language.state()
+            language.link(tail, start)
+
+            if kind == 'str':
+                end = language.state()
+                language.link(start, end, ('class', 'non-slash'))
+                language.link(end, end, ('class', 'non-slash'))
+            elif kind == 'path':
+                end = language.state()
+                language.link(start, end, ('class', 'non-newline'))
+                language.link(end, end, ('class', 'non-newline'))
+            elif kind == 'int':
+                end = language.state()
+                signed = language.state()
+                language.link(start, signed)
+                language.link(start, signed, ('char', '-'))
+                language.link(signed, end, ('class', 'decimal'))
+                language.link(end, end, ('class', 'decimal'))
+            elif kind == 'float':
+                end = language.state()
+                signed = language.state()
+                digits = language.state()
+                fraction = language.state()
+                language.link(start, signed)
+                language.link(start, signed, ('char', '-'))
+                language.link(signed, digits, ('class', 'decimal'))
+                language.link(signed, fraction, ('char', '.'))
+                language.link(fraction, end, ('class', 'decimal'))
+                language.link(digits, end, ('char', '.'))
+                language.link(digits, end, ('class', 'decimal'))
+                language.link(end, end, ('class', 'decimal'))
+
+            tail = end
+
+        for token_type, value in tokens:
+            if token_type == 'literal':
+                add_literal(value)
+            else:
+                add_kind(token_type)
+
+        language.accept = tail
+        return language
+
+    @staticmethod
+    def _segment(rule, key, mode, conf):
+        if mode == 'default':
+            if conf is None:
+                return '<%s>' % (key or '')
+            if key:
+                return ':%s#%s#' % (key, conf)
+            return ':#%s#' % conf
+        if conf is None:
+            return '<%s:%s>' % (key or '', mode)
+        return '<%s:%s:%s>' % (key or '', mode, conf)
+
+    @classmethod
+    def analyze(cls, router, rule, method):
+        tokens = []
+        unknown = []
+
+        for key, mode, conf in router._itertokens(rule):
+            if mode is None:
+                tokens.append(('literal', key))
+                continue
+
+            effective_mode = mode
+            effective_conf = conf
+            if mode == 'default':
+                effective_mode = router.default_filter
+                effective_conf = conf
+
+            kind = None
+            reason = None
+            segment = cls._segment(rule, key, mode, conf)
+
+            if effective_mode == 're':
+                if (mode == 're' and not effective_conf) or \
+                        (mode == 'default' and effective_conf is None):
+                    kind = 'str'
+                else:
+                    reason = 'custom regular expression %r is not supported' \
+                        % effective_conf
+            elif effective_mode in ('str', 'int', 'float', 'path'):
+                if router.filters.get(effective_mode) is \
+                        router._builtin_filters.get(effective_mode):
+                    kind = effective_mode
+                else:
+                    reason = 'custom %r filter is not the built-in filter' \
+                        % effective_mode
+            else:
+                reason = 'custom %r filter is not supported' % effective_mode
+
+            if reason:
+                unknown.append({
+                    'status': 'unknown',
+                    'kind': 'unknown',
+                    'method': method,
+                    'rule': rule,
+                    'segment': segment,
+                    'reason': '%s in %s' % (reason, segment),
+                })
+            else:
+                tokens.append((kind, None))
+
+        if unknown:
+            return None, unknown
+        return cls._language(tokens), []
+
+    @staticmethod
+    def _matches(predicate, char):
+        kind, value = predicate
+        if kind == 'char':
+            return char == value
+        if value == 'non-slash':
+            return char != '/'
+        if value == 'non-newline':
+            return char != '\n'
+        if value == 'decimal':
+            return char.isdecimal()
+        return False
+
+    @staticmethod
+    def _closure(language, states, cache=None):
+        states = frozenset(states)
+        if cache is None:
+            cache = {}
+        if states in cache:
+            return cache[states]
+        pending = list(states)
+        result = set(states)
+        while pending:
+            state = pending.pop()
+            for target in language.epsilon[state]:
+                if target not in result:
+                    result.add(target)
+                    pending.append(target)
+        result = frozenset(result)
+        cache[states] = result
+        return result
+
+    @staticmethod
+    def _step(language, states, char, cache):
+        result = set()
+        for state in states:
+            for predicate, target in language.edges[state]:
+                if _RouteDiagnostics._matches(predicate, char):
+                    result.update(_RouteDiagnostics._closure(
+                        language, [target], cache))
+        return frozenset(result)
+
+    @staticmethod
+    def _alphabet(*languages):
+        symbols = set(['-', '.', '/', 'a']) | set(map(str, range(10)))
+        symbols.add('\n')
+        for language in languages:
+            symbols.update(language.symbols)
+        generic = ord('b')
+        while chr(generic) in symbols or chr(generic) in '/\n.-' or \
+                chr(generic).isdecimal():
+            generic += 1
+        symbols.add(chr(generic))
+        ordered = sorted(symbols - {'\n'})
+        ordered.append('\n')
+        return ordered
+
+    @classmethod
+    def _intersection_witness(cls, first, second, blockers=None):
+        languages = [first, second]
+        if blockers is not None:
+            languages.append(blockers)
+        alphabet = cls._alphabet(*languages)
+        caches = [{}, {}, {}]
+        start = (
+            cls._closure(first, [first.start], caches[0]),
+            cls._closure(second, [second.start], caches[1]),
+            cls._closure(blockers, [blockers.start], caches[2])
+            if blockers is not None else frozenset())
+        queue = [start]
+        paths = {start: []}
+
+        while queue:
+            state = queue.pop(0)
+            first_state, second_state, blocker_state = state
+            if first.accept in first_state and second.accept in second_state \
+                    and (blockers is None
+                         or blockers.accept not in blocker_state):
+                return ''.join(paths[state])
+
+            for char in alphabet:
+                next_state = (
+                    cls._step(first, first_state, char, caches[0]),
+                    cls._step(second, second_state, char, caches[1]),
+                    cls._step(blockers, blocker_state, char, caches[2])
+                    if blockers is not None else frozenset())
+                if next_state not in paths:
+                    paths[next_state] = paths[state] + [char]
+                    queue.append(next_state)
+        return None
+
+    @classmethod
+    def _contains(cls, wide, narrow):
+        alphabet = cls._alphabet(wide, narrow)
+        wide_cache = {}
+        narrow_cache = {}
+        start = (
+            cls._closure(wide, [wide.start], wide_cache),
+            cls._closure(narrow, [narrow.start], narrow_cache))
+        queue = [start]
+        seen = {start}
+
+        while queue:
+            wide_state, narrow_state = queue.pop(0)
+            if narrow.accept in narrow_state and wide.accept not in wide_state:
+                return False
+            for char in alphabet:
+                next_state = (
+                    cls._step(wide, wide_state, char, wide_cache),
+                    cls._step(narrow, narrow_state, char, narrow_cache))
+                if next_state not in seen:
+                    seen.add(next_state)
+                    queue.append(next_state)
+        return True
+
+    @staticmethod
+    def _union(languages):
+        if len(languages) == 1:
+            return languages[0]
+        union = _RouteLanguage()
+        mapping = {}
+        for language in languages:
+            offset = len(union.edges)
+            for _ in language.edges:
+                union.state()
+            for source, targets in enumerate(language.epsilon):
+                union.epsilon[offset + source].update(
+                    offset + target for target in targets)
+            for source, edges in enumerate(language.edges):
+                for predicate, target in edges:
+                    union.link(offset + source, offset + target, predicate)
+            union.link(union.start, offset + language.start)
+            mapping[id(language)] = offset + language.accept
+            union.symbols.update(language.symbols)
+        union.accept = union.state()
+        for language in languages:
+            union.link(mapping[id(language)], union.accept)
+        return union
+
+    @staticmethod
+    def _context(first_method, second_method):
+        methods = {first_method, second_method}
+        if len(methods) == 1:
+            method = first_method
+            if method == 'PROXY':
+                return 'GET'
+            return method
+        if 'PROXY' in methods:
+            other = methods - {'PROXY'}
+            method = next(iter(other))
+            return 'GET' if method == 'ANY' else method
+        if methods == {'HEAD', 'GET'}:
+            return 'HEAD'
+        if 'ANY' in methods:
+            method = next(iter(methods - {'ANY'}))
+            return method
+        return None
+
+    @staticmethod
+    def _layer(method, verb):
+        if method == 'PROXY':
+            return 0
+        if verb == 'HEAD':
+            return {'HEAD': 1, 'GET': 2, 'ANY': 3}.get(method)
+        if method == verb:
+            return 1
+        if method == 'ANY':
+            return 2
+        return None
+
+    @classmethod
+    def compare(cls, router, chains, first, second):
+        verb = cls._context(first['method'], second['method'])
+        if verb is None:
+            return None
+        first_layer = cls._layer(first['method'], verb)
+        second_layer = cls._layer(second['method'], verb)
+
+        def priority(record, layer):
+            kind_rank = 0 if record['kind'] == 'static' and \
+                not router.strict_order else 1
+            return layer, kind_rank, record['order']
+
+        first_priority = priority(first, first_layer)
+        second_priority = priority(second, second_layer)
+        if first_priority <= second_priority:
+            winner, loser = first, second
+        else:
+            winner, loser = second, first
+
+        winner_language = winner['language']
+        loser_language = loser['language']
+        candidates = chains[verb]
+
+        winner_priority = priority(winner, cls._layer(winner['method'], verb))
+        unblocked_witness = cls._intersection_witness(
+            winner_language, loser_language)
+        if unblocked_witness is None:
+            return None
+
+        blockers = [
+            record['language'] for record_priority, record in candidates
+            if record_priority < winner_priority
+            and cls._intersection_witness(
+                record['language'], winner_language) is not None]
+        witness = unblocked_witness
+        if blockers:
+            witness = cls._intersection_witness(
+                winner_language, loser_language, cls._union(blockers))
+        if witness is None:
+            return None
+
+        try:
+            target, args = router.match({
+                'PATH_INFO': witness,
+                'REQUEST_METHOD': verb,
+            })
+            if target is not winner['target']:
+                return None
+            if loser['getargs'] is not None:
+                loser['getargs'](witness)
+            if winner['getargs'] is not None and args is None:
+                winner['getargs'](witness)
+        except HTTPError:
+            return None
+
+        shadowed = cls._contains(winner_language, loser_language)
+        status = 'shadowed' if shadowed else 'ambiguous'
+        return {
+            'status': status,
+            'kind': status,
+            'type': 'shadow' if shadowed else 'ambiguity',
+            'method': verb,
+            'request_method': verb,
+            'methods': sorted([first['method'], second['method']]),
+            'registered_methods': sorted([first['method'], second['method']]),
+            'rule': loser['rule'],
+            'rules': [winner['rule'], loser['rule']],
+            'winner': winner['rule'],
+            'winning_rule': winner['rule'],
+            'loser': loser['rule'],
+            'losing_rule': loser['rule'],
+            'shadowed_rule': loser['rule'],
+            'shadowed_by': winner['rule'],
+            'witness': witness,
+            'witness_path': witness,
+            'path': witness,
+        }
+
+
 class Router:
     """ A Router is an ordered collection of route->target pairs. It is used to
         efficiently match WSGI requests against a number of routes and return
@@ -287,12 +686,14 @@ class Router:
         #: If true, static routes are no longer checked first.
         self.strict_order = strict
         self.filters = {
+            'str': lambda conf: (r'[^/]+', None, None),
             're': lambda conf: (_re_flatten(conf or self.default_pattern),
                                 None, None),
             'int': lambda conf: (r'-?\d+', int, lambda x: str(int(x))),
             'float': lambda conf: (r'-?[\d.]+', float, lambda x: str(float(x))),
             'path': lambda conf: (r'.+?', None, None)
         }
+        self._builtin_filters = dict(self.filters)
 
     def add_filter(self, name, func):
         """ Add a filter. The provided function is called with the configuration
@@ -413,6 +814,90 @@ class Router:
             combined = re.compile(combined).match
             rules = [(target, getargs) for (_, _, target, getargs) in some]
             comborules.append((combined, rules))
+
+    def _diagnostic_record_objects(self):
+        records = []
+        methods = set(self.static) | set(self.dyna_routes)
+        for method in sorted(methods):
+            if self.strict_order:
+                for order, (rule, flatpat, target, getargs) in enumerate(
+                        self.dyna_routes.get(method, ())):
+                    records.append({
+                        'method': method, 'kind': 'dynamic', 'order': order,
+                        'rule': rule, 'target': target, 'getargs': getargs})
+                continue
+
+            order = 0
+            for rule, (target, getargs) in self.static.get(method, {}).items():
+                records.append({
+                    'method': method, 'kind': 'static', 'order': order,
+                    'rule': rule, 'target': target, 'getargs': getargs})
+                order += 1
+            for dynamic_order, (rule, flatpat, target, getargs) in enumerate(
+                    self.dyna_routes.get(method, ())):
+                records.append({
+                    'method': method, 'kind': 'dynamic',
+                    'order': order, 'dynamic_order': dynamic_order,
+                    'rule': rule, 'target': target, 'getargs': getargs})
+                order += 1
+        return records
+
+    def _diagnostic_analyzed_records(self):
+        records = []
+
+        for index, record in enumerate(self._diagnostic_record_objects()):
+            language, unknown = _RouteDiagnostics.analyze(
+                self, record['rule'], record['method'])
+            record['language'] = language
+            record['unknown'] = unknown
+            record['index'] = index
+            records.append(record)
+        return records
+
+    def route_diagnostics(self):
+        """ Return deterministic, read-only route overlap reports.
+
+        Each report has a ``status`` of ``ambiguous``, ``shadowed`` or
+        ``unknown``, the relevant HTTP ``method``, the two ``rules`` and a
+        ``witness`` path for actual conflicts. Unknown reports identify the
+        unanalyzable ``segment`` and ``reason``. Witness paths are verified
+        by :meth:`match`, including int/float conversions.
+        """
+        records = self._diagnostic_analyzed_records()
+        chains = {}
+        verbs = {record['method'] for record in records}
+        if 'GET' in verbs:
+            verbs.add('HEAD')
+        for verb in verbs:
+            chain = []
+            for record in records:
+                layer = _RouteDiagnostics._layer(record['method'], verb)
+                if layer is not None and record['language'] is not None:
+                    kind_rank = 0 if record['kind'] == 'static' and \
+                        not self.strict_order else 1
+                    chain.append((
+                        (layer, kind_rank, record['order']), record))
+            chain.sort(key=lambda item: item[0])
+            chains[verb] = chain
+        reports = []
+
+        for record in records:
+            if record['language'] is None:
+                reports.extend(record['unknown'])
+
+        for index, first in enumerate(records):
+            if first['language'] is None:
+                continue
+            for second in records[index + 1:]:
+                if second['language'] is None:
+                    continue
+                report = _RouteDiagnostics.compare(self, chains, first, second)
+                if report is not None:
+                    reports.append(report)
+
+        return reports
+
+    diagnose_routes = route_diagnostics
 
     def build(self, _name, *anons, **query):
         """ Build an URL by filling the wildcards in a rule. """
@@ -830,6 +1315,12 @@ class Bottle:
             tuple. The second value is a dictionary with parameters extracted
             from the URL. Raise :exc:`HTTPError` (404/405) on a non-match."""
         return self.router.match(environ)
+
+    def route_diagnostics(self):
+        """ Return deterministic, read-only route overlap reports. """
+        return self.router.route_diagnostics()
+
+    diagnose_routes = route_diagnostics
 
     def get_url(self, routename, **kargs):
         """ Return a string that matches a named route """

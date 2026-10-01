@@ -43,10 +43,29 @@ Filters are used to define more specific wildcards, and/or transform the matched
 
 The following standard filters are implemented:
 
+* **:str** matches one path segment (anything except a slash) without converting the value.
 * **:int** matches (signed) digits and converts the value to integer.
 * **:float** similar to :int but for decimal numbers.
 * **:path** matches all characters including the slash character in a non-greedy way and may be used to match more than one path segment.
 * **:re[:exp]** allows you to specify a custom regular expression in the config field. The matched value is not modified.
+
+Route diagnostics
+~~~~~~~~~~~~~~~~~
+
+:meth:`Bottle.route_diagnostics` returns a read-only list of reports for
+overlapping routes. Ambiguous rules and rules fully shadowed by a higher
+priority rule include a verified ``witness`` path. The built-in ``str``,
+``int``, ``float`` and ``path`` filters and static fragments are analyzed
+exactly. Rules using custom filters or explicit regular expressions are
+reported as ``unknown`` with the unanalyzable rule segment and reason.
+
+The analysis follows normal HTTP method priority, including the ``HEAD``
+fallback to ``GET`` routes, and witnesses are checked again with
+:meth:`Router.match`. Calling the method does not add temporary routes or
+change route order::
+
+    for report in app.route_diagnostics():
+        print(report['status'], report.get('rules'), report.get('witness'))
 
 You can add your own filters to the router. All you need is a function that returns three elements: A regular expression string, a callable to convert the URL fragment to a python value, and a callable that does the opposite. The filter function is called with the configuration string as the only parameter and may parse it as needed::
 
