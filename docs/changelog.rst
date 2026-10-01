@@ -53,6 +53,7 @@ Release 0.14 (in development)
 
 .. rubric:: New features
 
+* Routes can be restricted to a request host with the new ``host`` parameter of :meth:`Bottle.route`, including wildcards (e.g. ``<tenant>.example.com``), optional ports and IPv6 literals. Hostnames are matched case-insensitively and internationalized domain names are normalized. See :doc:`routing` for details.
 * ``bottle.HTTPError`` raised on invalid JSON now include the underlying exception in the ``exception`` field.
 
 
@@ -272,4 +273,3 @@ This is an incomplete list of new features and improved functionality.
 * New :func:`get`, :func:`post`, :func:`put` and :func:`delete` decorators.
 * The :class:`SimpleTemplate` engine got full unicode support.
 * Lots of non-critical bugfixes.
-

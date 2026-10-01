@@ -92,6 +92,54 @@ Old Syntax          New Syntax
 Try to avoid the old syntax in future projects if you can. It is not currently deprecated, but will be eventually.
 
 
+Host Rules
+--------------------------------------------------------------------------------
+
+.. versionadded:: 0.14
+
+Routes can be restricted to a specific request host with the ``host`` parameter of :meth:`Bottle.route`. This allows different applications or tenants to be served from the same URL path, depending on the ``Host`` header of the request::
+
+    @app.route('/reports/<id>', host='<tenant>.example.com')
+    def report(tenant, id):
+        ...
+
+Host rules use the same wildcard syntax and filters as path rules, with two differences: A wildcard without a filter matches a single DNS label (``[^.]+`` instead of ``[^/]+``), and the deprecated ``:name`` syntax is not allowed, because a colon is ambiguous with the port separator. Wildcard names must be unique across the host rule and the path rule of a route; a name collision raises :exc:`RouteSyntaxError` when the route is registered.
+
+An optional port restricts the rule to requests with that port (e.g. ``example.com:8080``). A rule without a port matches any port. The default port of the request scheme (80 for http, 443 for https) is normalized away, so ``example.com`` and ``example.com:80`` are the same request host and never match the same rule twice.
+
+Hostnames are normalized before matching, so rules and requests compare equal regardless of:
+
+* **Case:** Hostnames are matched case-insensitively.
+* **Trailing dot:** ``example.com.`` equals ``example.com``.
+* **Internationalized domain names:** Unicode names and their punycode form are interchangeable (``münchen.de`` equals ``xn--mnchen-3ya.de``). Matched host wildcards are passed to the callback in unicode form.
+* **IPv6 literals:** Addresses are canonicalized (``[0:0:0:0:0:0:0:1]`` equals ``[::1]``).
+
+Wildcard patterns and filters are applied to the normalized hostname, that is, the lowercase unicode form described above.
+
+A request with a malformed ``Host`` header is answered with ``400 Bad Request``, but only if the application actually defines host rules. Applications without host rules are not affected.
+
+If several routes could handle a request, they are considered in the following order:
+
+#. Routes with a static host rule and a matching port.
+#. Routes with a static host rule and no port.
+#. Routes with a dynamic host rule, in order of registration.
+#. Routes without a host rule.
+
+Within each of these groups, static path rules are checked before dynamic path rules, as usual.
+
+Behind a reverse proxy, the ``X-Forwarded-Host`` header is **not** used for routing unless the application explicitly opts in, because clients can send this header, too::
+
+    app.config['router.trust_forwarded_host'] = True
+
+Named routes with a host rule can be reversed with :meth:`Bottle.get_url`. Host wildcards are filled from the same keyword arguments as path wildcards, but escaped as DNS labels (IDNA encoded) instead of path segments. The result is a scheme-relative URL::
+
+    @app.route('/reports/<id>', host='<tenant>.example.com', name='report')
+    def report(tenant, id):
+        ...
+
+    app.get_url('report', tenant='münchen', id=5)
+    # '//xn--mnchen-3ya.example.com/reports/5'
+
 
 Explicit routing configuration
 --------------------------------------------------------------------------------
