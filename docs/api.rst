@@ -160,6 +160,9 @@ Request routing
 .. autoclass:: Router
     :members:
 
+.. autoclass:: RouteHandle
+    :members:
+
 .. autoclass:: Route
     :members:
 

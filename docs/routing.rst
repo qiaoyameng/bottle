@@ -113,3 +113,35 @@ In fact, any :class:`Bottle` instance routing can be configured same way::
     app = Bottle()
     setup_routing(app)
 
+Removing routes
+--------------------------------------------------------------------------------
+
+Routes are usually registered for the entire lifetime of an application, but
+temporary routes (e.g. diagnostic endpoints) can be revoked again. Both
+:meth:`Router.add` and :meth:`Bottle.add_route` return a :class:`RouteHandle`
+that identifies one specific registration. Passing it to
+:meth:`Bottle.remove_route` (or :meth:`Router.remove`, or
+:meth:`RouteHandle.revoke`) removes exactly that registration::
+
+    route = bottle.Route(app, '/diag', 'GET', diag_handler)
+    handle = app.add_route(route)
+    ...
+    app.remove_route(handle)
+
+The handle, not the path rule, selects the registration, so revoking never
+affects other routes that happen to share the same rule or name. Revoking a
+handle twice is a no-op and returns ``False``. If a registration was
+overwritten by a newer one for the same rule and method, its handle becomes
+stale and revoking it is a no-op as well.
+
+Removal takes effect immediately for the next request: matching, the URL
+builder (``get_url``) and the method sets used for ``HEAD`` and ``405``
+responses all see the updated routing table. If several live routes share a
+name, the most recently registered one is visible to the URL builder;
+revoking it reveals the previous one. A request that already matched a route
+keeps its selected callback, even if the registration is revoked while the
+request is still running.
+
+:meth:`Bottle.mount` returns a list of handles, one for each mounted route,
+so mounted applications can be (partially) unmounted the same way.
+

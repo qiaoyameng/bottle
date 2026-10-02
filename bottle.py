@@ -249,6 +249,52 @@ class RouteBuildError(RouteError):
     """ The route could not be built. """
 
 
+class RouteHandle:
+    """ An opaque handle that identifies one specific route registration.
+
+        Instances are returned by :meth:`Router.add` and can be passed to
+        :meth:`Router.remove` (or :meth:`RouteHandle.revoke`) to undo exactly
+        that registration. Unlike a path rule, a handle always points to a
+        single registration, even if the same rule was registered multiple
+        times.
+
+        A handle becomes stale (``active`` is False) once its registration
+        was revoked or overwritten by a newer registration for the same
+        rule and method. Revoking a stale handle is a no-op.
+    """
+
+    __slots__ = ('router', 'rule', 'method', 'target', 'name', 'is_static',
+                 'key', 'builder_keys', 'active')
+
+    def __init__(self, router, rule, method, target, name):
+        #: The router this registration belongs to.
+        self.router = router
+        #: The path-rule string of the registration.
+        self.rule = rule
+        #: The HTTP method of the registration.
+        self.method = method
+        #: The target that was registered (e.g. a :class:`Route`).
+        self.target = target
+        #: The route name of the registration, if any.
+        self.name = name
+        #: True if the registration lives in the static route table.
+        self.is_static = False
+        self.key = None
+        self.builder_keys = []
+        #: False once the registration was revoked or overwritten.
+        self.active = True
+
+    def revoke(self):
+        """ Remove this registration from its router. Returns True if this
+            call actually removed the registration, False if the handle was
+            already stale. See :meth:`Router.remove`. """
+        return self.router.remove(self)
+
+    def __repr__(self):
+        state = '' if self.active else ' (revoked)'
+        return '<RouteHandle %s %s%s>' % (self.method, self.rule, state)
+
+
 def _re_flatten(p):
     """ Turn all capturing groups in a regular expression pattern into
         non-capturing groups. """
@@ -284,6 +330,9 @@ class Router:
         self.static = {}  # Search structure for static routes
         self.dyna_routes = {}
         self.dyna_regexes = {}  # Search structure for dynamic routes
+        self._static_handles = {}  # (method, path) -> live handle
+        self._dyna_handles = {}  # method -> handles, parallel to dyna_routes
+        self._builder_stack = {}  # name/rule -> stack of (handle, builder)
         #: If true, static routes are no longer checked first.
         self.strict_order = strict
         self.filters = {
@@ -326,8 +375,37 @@ class Router:
         if offset <= len(rule) or prefix:
             yield prefix + rule[offset:], None, None
 
+    def _push_builder(self, key, builder, handle):
+        self._builder_stack.setdefault(key, []).append((handle, builder))
+        self.builder[key] = builder
+        handle.builder_keys.append(key)
+
+    def _drop_builder(self, handle):
+        for key in handle.builder_keys:
+            stack = self._builder_stack.get(key)
+            if not stack:
+                continue
+            stack = [entry for entry in stack if entry[0] is not handle]
+            if stack:
+                self._builder_stack[key] = stack
+                self.builder[key] = stack[-1][1]
+            else:
+                del self._builder_stack[key]
+                self.builder.pop(key, None)
+        handle.builder_keys = []
+
+    def _supersede(self, handle):
+        """ Mark a handle as overwritten by a newer registration. """
+        handle.active = False
+        self._drop_builder(handle)
+
     def add(self, rule, method, target, name=None):
-        """ Add a new rule or replace the target for an existing rule. """
+        """ Add a new rule or replace the target for an existing rule.
+            Returns a :class:`RouteHandle` that identifies this specific
+            registration and can be passed to :meth:`remove` to revoke it.
+
+            If a registration for the same rule and method already exists,
+            it is replaced and its handle becomes stale. """
         anons = []  # Generated names of anonymous wildcards
         keys = []  # Names of keys
         pattern = ''  # Regular expression pattern with named groups
@@ -351,13 +429,24 @@ class Router:
                 pattern += re.escape(key)
                 builder.append((None, key))
 
-        self.builder[rule] = builder
-        if name: self.builder[name] = builder
+        handle = RouteHandle(self, rule, method, target, name)
 
         if is_static and not self.strict_order:
             self.static.setdefault(method, {})
-            self.static[method][self.build(rule)] = (target, None)
-            return
+            self._push_builder(rule, builder, handle)
+            if name: self._push_builder(name, builder, handle)
+            key = self.build(rule)
+            old = self._static_handles.get((method, key))
+            if old is not None:
+                self._supersede(old)
+            handle.is_static = True
+            handle.key = key
+            self.static[method][key] = (target, None)
+            self._static_handles[method, key] = handle
+            return handle
+
+        self._push_builder(rule, builder, handle)
+        if name: self._push_builder(name, builder, handle)
 
         try:
             re_pattern = re.compile('^(%s)$' % pattern)
@@ -390,20 +479,69 @@ class Router:
         flatpat = _re_flatten(pattern)
         whole_rule = (rule, flatpat, target, getargs)
 
+        handle.key = flatpat
+
         if (flatpat, method) in self._groups:
             if DEBUG:
                 msg = 'Route <%s %s> overwrites a previously defined route'
                 warnings.warn(msg % (method, rule), RuntimeWarning, stacklevel=3)
-            self.dyna_routes[method][
-                self._groups[flatpat, method]] = whole_rule
+            index = self._groups[flatpat, method]
+            self._supersede(self._dyna_handles[method][index])
+            self.dyna_routes[method][index] = whole_rule
+            self._dyna_handles[method][index] = handle
         else:
             self.dyna_routes.setdefault(method, []).append(whole_rule)
+            self._dyna_handles.setdefault(method, []).append(handle)
             self._groups[flatpat, method] = len(self.dyna_routes[method]) - 1
 
         self._compile(method)
+        return handle
+
+    def remove(self, handle):
+        """ Remove a route registration previously created by :meth:`add`.
+
+            The handle must be the exact :class:`RouteHandle` returned by
+            :meth:`add`; rules are never matched by path string. Returns True
+            if the registration was removed, False if the handle was already
+            stale (revoked or overwritten). Matching structures, the combined
+            regular expressions and the URL builder are updated immediately,
+            so requests matched afterwards see the new routing table. Requests
+            that already matched a route are unaffected and keep their
+            previously selected callback. """
+        if not isinstance(handle, RouteHandle) or handle.router is not self:
+            raise RouteError("Handle does not belong to this router.")
+        if not handle.active:
+            return False
+        handle.active = False
+        self._drop_builder(handle)
+        if handle.is_static:
+            key = (handle.method, handle.key)
+            if self._static_handles.get(key) is handle:
+                del self._static_handles[key]
+                del self.static[handle.method][handle.key]
+                if not self.static[handle.method]:
+                    del self.static[handle.method]
+            return True
+        method = handle.method
+        handles = self._dyna_handles[method]
+        index = handles.index(handle)
+        del handles[index]
+        del self.dyna_routes[method][index]
+        if not handles:
+            del self._dyna_handles[method]
+            del self.dyna_routes[method]
+        for flatpat, m in [k for k in self._groups if k[1] == method]:
+            del self._groups[flatpat, m]
+        for index, other in enumerate(self._dyna_handles.get(method, [])):
+            self._groups[other.key, method] = index
+        self._compile(method)
+        return True
 
     def _compile(self, method):
-        all_rules = self.dyna_routes[method]
+        all_rules = self.dyna_routes.get(method, [])
+        if not all_rules:
+            self.dyna_regexes.pop(method, None)
+            return
         comborules = self.dyna_regexes[method] = []
         maxgroups = self._MAX_GROUPS_PER_PATTERN
         for x in range(0, len(all_rules), maxgroups):
@@ -711,6 +849,7 @@ class Bottle:
         self.route('/%s/<:re:.*>' % '/'.join(segments), **options)
         if not prefix.endswith('/'):
             self.route('/' + '/'.join(segments), **options)
+        return []
 
     def _mount_app(self, prefix, app, **options):
         if app in self._mounts or '_mount.app' in app.config:
@@ -731,9 +870,11 @@ class Bottle:
         self._mounts.append(app)
         app.config['_mount.prefix'] = prefix
         app.config['_mount.app'] = self
+        handles = []
         for route in app.routes:
             route.rule = prefix + route.rule.lstrip('/')
-            self.add_route(route)
+            handles.append(self.add_route(route))
+        return handles
 
     def mount(self, prefix, app, **options):
         """ Mount an application (:class:`Bottle` or plain WSGI) to a specific
@@ -755,6 +896,11 @@ class Bottle:
             root of the child application via `/prefix` in addition to
             `/prefix/`, consider adding a route with a 307 redirect to the
             parent application.
+
+            Returns a list of :class:`RouteHandle` objects, one for each
+            mounted route, which can be passed to :meth:`remove_route` to
+            unmount individual routes later. Plain WSGI mounts yield an
+            empty list.
         """
 
         if not prefix.startswith('/'):
@@ -839,10 +985,31 @@ class Bottle:
 
     def add_route(self, route):
         """ Add a route object, but do not change the :data:`Route.app`
-            attribute."""
+            attribute. Returns a :class:`RouteHandle` that identifies this
+            specific registration and can be passed to :meth:`remove_route`
+            to revoke it later. """
         self.routes.append(route)
-        self.router.add(route.rule, route.method, route, name=route.name)
+        handle = self.router.add(route.rule, route.method, route, name=route.name)
         if DEBUG: route.prepare()
+        return handle
+
+    def remove_route(self, handle):
+        """ Remove a route registration previously created by :meth:`route`
+            or :meth:`add_route`. The handle must be the exact
+            :class:`RouteHandle` returned by :meth:`add_route` for that
+            registration; routes are never selected by path string.
+
+            Returns True if the registration was removed, False if the
+            handle was already stale (revoked or overwritten by a newer
+            registration for the same rule and method). Requests that
+            already matched the route keep their selected callback; the
+            next request sees the updated routing table. """
+        removed = self.router.remove(handle)
+        if removed:
+            route = handle.target
+            if isinstance(route, Route) and route in self.routes:
+                self.routes.remove(route)
+        return removed
 
     def route(self,
               path=None,

@@ -36,6 +36,10 @@ to receive updates on a best-effort basis.
 Release 0.14 (in development)
 =============================
 
+.. rubric:: New APIs and features
+
+* :meth:`Router.add` and :meth:`Bottle.add_route` now return a :class:`RouteHandle` that identifies one specific route registration. Passing the handle to :meth:`Router.remove` or :meth:`Bottle.remove_route` revokes exactly that registration and updates matching, URL building and HEAD/405 method handling accordingly. :meth:`Bottle.mount` returns a list of handles for the mounted routes.
+
 .. rubric:: Deprecated APIs or behavior
 
 * ``Route.get_undecorated_callback()`` was able to look into closure cells to guess the original function wrapped by a decorator, but this is too aggressive in some cases and may return the wrong function. To avoid this, we will depend on proper use of ``@functools.wraps(orig)`` or ``functools.update_wrapper(wrapper, orig)`` in decorators in the future.
@@ -272,4 +276,3 @@ This is an incomplete list of new features and improved functionality.
 * New :func:`get`, :func:`post`, :func:`put` and :func:`delete` decorators.
 * The :class:`SimpleTemplate` engine got full unicode support.
 * Lots of non-critical bugfixes.
-
