@@ -113,3 +113,33 @@ In fact, any :class:`Bottle` instance routing can be configured same way::
     app = Bottle()
     setup_routing(app)
 
+
+Temporary Routes
+--------------------------------------------------------------------------------
+
+The methods :meth:`Bottle.add_route` and :meth:`Router.add` return an opaque
+handle for exactly one registration. Pass that handle to
+:meth:`Bottle.remove_route` or :meth:`Router.remove` to undo only that
+registration::
+
+    route = Route(app, '/diagnostic', 'GET', diagnostic_callback)
+    handle = app.add_route(route)
+    app.remove_route(handle)
+
+The :meth:`Bottle.route` decorator keeps returning the callback for
+decorator compatibility. Call it directly with ``return_handle=True`` when the
+handle is needed. If multiple rules or methods are registered, the result is a
+list of handles::
+
+    handles = app.route('/diagnostic', callback=diagnostic_callback,
+                        return_handle=True)
+
+Removing a registration updates both static and dynamic matching, rebuilds
+combined regular expressions, URL builders and 405 method sets. If a rule or
+route name is registered more than once, the newest active registration is
+visible. Removing that registration reveals the previous one, while removing a
+handle more than once has no effect and returns ``False``.
+
+A route selected by an in-progress request remains its callback object even if
+the route is removed from that callback; subsequent requests use the updated
+routing table.

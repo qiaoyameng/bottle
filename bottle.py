@@ -249,6 +249,33 @@ class RouteBuildError(RouteError):
     """ The route could not be built. """
 
 
+class RouteRegistration:
+    """ A handle for a single router registration. """
+
+    __slots__ = ('id', 'router', 'rule', 'method', 'target', 'name',
+                 'flatpat', 'getargs', 'is_static', 'builder',
+                 'builder_keys', 'active')
+
+    def __init__(self, id, router, rule, method, target, name, flatpat,
+                 getargs, is_static, builder, builder_keys):
+        self.id = id
+        self.router = router
+        self.rule = rule
+        self.method = method
+        self.target = target
+        self.name = name
+        self.flatpat = flatpat
+        self.getargs = getargs
+        self.is_static = is_static
+        self.builder = builder
+        self.builder_keys = builder_keys
+        self.active = True
+
+    def remove(self):
+        """ Remove this registration from its router. """
+        return self.router.remove(self)
+
+
 def _re_flatten(p):
     """ Turn all capturing groups in a regular expression pattern into
         non-capturing groups. """
@@ -284,6 +311,10 @@ class Router:
         self.static = {}  # Search structure for static routes
         self.dyna_routes = {}
         self.dyna_regexes = {}  # Search structure for dynamic routes
+        self._static_rules = {}
+        self._dynamic_rules = {}
+        self._builder_rules = {}
+        self._next_rule_id = 0
         #: If true, static routes are no longer checked first.
         self.strict_order = strict
         self.filters = {
@@ -327,7 +358,7 @@ class Router:
             yield prefix + rule[offset:], None, None
 
     def add(self, rule, method, target, name=None):
-        """ Add a new rule or replace the target for an existing rule. """
+        """ Add a new rule and return a handle for that registration. """
         anons = []  # Generated names of anonymous wildcards
         keys = []  # Names of keys
         pattern = ''  # Regular expression pattern with named groups
@@ -350,14 +381,6 @@ class Router:
             elif key:
                 pattern += re.escape(key)
                 builder.append((None, key))
-
-        self.builder[rule] = builder
-        if name: self.builder[name] = builder
-
-        if is_static and not self.strict_order:
-            self.static.setdefault(method, {})
-            self.static[method][self.build(rule)] = (target, None)
-            return
 
         try:
             re_pattern = re.compile('^(%s)$' % pattern)
@@ -388,19 +411,128 @@ class Router:
             getargs = None
 
         flatpat = _re_flatten(pattern)
-        whole_rule = (rule, flatpat, target, getargs)
+        self._next_rule_id += 1
+        builder_keys = [rule]
+        if name:
+            builder_keys.append(name)
+        handle = RouteRegistration(self._next_rule_id, self, rule, method,
+                                   target, name, flatpat, getargs,
+                                   is_static, builder, builder_keys)
 
-        if (flatpat, method) in self._groups:
-            if DEBUG:
-                msg = 'Route <%s %s> overwrites a previously defined route'
-                warnings.warn(msg % (method, rule), RuntimeWarning, stacklevel=3)
-            self.dyna_routes[method][
-                self._groups[flatpat, method]] = whole_rule
+        for key in builder_keys:
+            stack = self._builder_rules.setdefault(key, [])
+            stack.append(handle)
+            self.builder[key] = builder
+
+        self.rules.append(handle)
+
+        if is_static and not self.strict_order:
+            path = self.build(rule)
+            stack = self._static_rules.setdefault(method, {}).setdefault(path, [])
+            stack.append(handle)
+            self.static.setdefault(method, {})[path] = (target, getargs)
         else:
-            self.dyna_routes.setdefault(method, []).append(whole_rule)
-            self._groups[flatpat, method] = len(self.dyna_routes[method]) - 1
+            stack = self._dynamic_rules.setdefault(method, {}) \
+                                      .setdefault(handle.flatpat, [])
+            stack.append(handle)
+            self._rebuild_dynamic(method)
 
-        self._compile(method)
+        return handle
+
+    def remove(self, handle):
+        """ Remove a registration identified by its handle. """
+        if not isinstance(handle, RouteRegistration) or handle.router is not self:
+            return False
+        if not handle.active:
+            return False
+
+        if handle.is_static and not self.strict_order:
+            path = self.build(handle.rule)
+            stack = self._static_rules.get(handle.method, {}).get(path)
+            if stack is None:
+                return False
+            try:
+                index = stack.index(handle)
+            except ValueError:
+                return False
+            del stack[index]
+            static = self.static.get(handle.method, {})
+            if not stack:
+                del self._static_rules[handle.method][path]
+                static.pop(path, None)
+            elif index == len(stack):
+                active = stack[-1]
+                static[path] = (active.target, active.getargs)
+            if not self._static_rules.get(handle.method):
+                self._static_rules.pop(handle.method, None)
+                self.static.pop(handle.method, None)
+        else:
+            stack = self._dynamic_rules.get(handle.method, {}) \
+                                       .get(handle.flatpat)
+            if stack is None:
+                return False
+            try:
+                index = stack.index(handle)
+            except ValueError:
+                return False
+            del stack[index]
+            if not stack:
+                del self._dynamic_rules[handle.method][handle.flatpat]
+            self._rebuild_dynamic(handle.method)
+
+        for key in handle.builder_keys:
+            stack = self._builder_rules.get(key)
+            if stack is None:
+                continue
+            try:
+                index = stack.index(handle)
+            except ValueError:
+                continue
+            del stack[index]
+            if not stack:
+                self._builder_rules.pop(key, None)
+                self.builder.pop(key, None)
+            elif index == len(stack):
+                active = stack[-1]
+                self.builder[key] = self._builder_for(active)
+
+        try:
+            self.rules.remove(handle)
+        except ValueError:
+            pass
+        handle.active = False
+        return True
+
+    def remove_route(self, handle):
+        """ Alias for :meth:`remove`. """
+        return self.remove(handle)
+
+    def _builder_for(self, handle):
+        return handle.builder
+
+    def _rebuild_dynamic(self, method):
+        stacks = self._dynamic_rules.get(method, {})
+        flatpats = sorted(stacks, key=lambda flatpat: stacks[flatpat][0].id)
+        all_rules = []
+        for flatpat in flatpats:
+            handle = stacks[flatpat][-1]
+            all_rules.append((handle.rule, handle.flatpat,
+                              handle.target, handle.getargs))
+
+        if all_rules:
+            self.dyna_routes[method] = all_rules
+            self._groups.update(
+                ((flatpat, method), index)
+                for index, flatpat in enumerate(flatpats)
+            )
+            self._compile(method)
+        else:
+            self.dyna_routes.pop(method, None)
+            self.dyna_regexes.pop(method, None)
+
+        for flatpat, other in list(self._groups):
+            if other == method and flatpat not in stacks:
+                del self._groups[flatpat, method]
 
     def _compile(self, method):
         all_rules = self.dyna_routes[method]
@@ -447,7 +579,9 @@ class Router:
 
         # No matching route found. Collect alternative methods for 405 response
         allowed = set([])
-        nocheck = set(methods)
+        nocheck = {'PROXY', verb, 'ANY'}
+        if verb == 'HEAD':
+            nocheck.add('GET')
         for method in set(self.static) - nocheck:
             if path in self.static[method]:
                 allowed.add(method)
@@ -493,6 +627,8 @@ class Route:
         #: plugin configuration and meta-data.
         self.config = app.config._make_overlay()
         self.config.load_dict(config)
+        #: The handle returned when this route was registered with a router.
+        self.handle = None
 
     @cached_property
     def call(self):
@@ -617,11 +753,13 @@ class Bottle:
             self.config['json.enable'] = False
 
         self._mounts = []
+        self._mounted_apps = {}
 
         #: A :class:`ResourceManager` for application files
         self.resources = ResourceManager()
 
         self.routes = []  # List of installed :class:`Route` instances.
+        self._route_handles = []
         self.router = Router()  # Maps requests to :class:`Route` instances.
         self.error_handler = {}
 
@@ -708,9 +846,12 @@ class Bottle:
         options.setdefault('mountpoint', {'prefix': prefix, 'target': app})
         options['callback'] = mountpoint_wrapper
 
-        self.route('/%s/<:re:.*>' % '/'.join(segments), **options)
+        handles = self.route('/%s/<:re:.*>' % '/'.join(segments),
+                             return_handle=True, **options)
         if not prefix.endswith('/'):
-            self.route('/' + '/'.join(segments), **options)
+            handles.extend(self.route('/' + '/'.join(segments),
+                                      return_handle=True, **options))
+        return handles
 
     def _mount_app(self, prefix, app, **options):
         if app in self._mounts or '_mount.app' in app.config:
@@ -731,9 +872,16 @@ class Bottle:
         self._mounts.append(app)
         app.config['_mount.prefix'] = prefix
         app.config['_mount.app'] = self
+        handles = []
+        mounted_routes = []
         for route in app.routes:
+            original_rule = route.rule
             route.rule = prefix + route.rule.lstrip('/')
-            self.add_route(route)
+            handle = self.add_route(route)
+            handles.append(handle)
+            mounted_routes.append((handle, route, original_rule))
+        self._mounted_apps[app] = mounted_routes
+        return handles
 
     def mount(self, prefix, app, **options):
         """ Mount an application (:class:`Bottle` or plain WSGI) to a specific
@@ -755,6 +903,8 @@ class Bottle:
             root of the child application via `/prefix` in addition to
             `/prefix/`, consider adding a route with a 307 redirect to the
             parent application.
+
+            Return a list of handles for the parent application registrations.
         """
 
         if not prefix.startswith('/'):
@@ -772,8 +922,10 @@ class Bottle:
             changed. """
         if isinstance(routes, Bottle):
             routes = routes.routes
+        handles = []
         for route in routes:
-            self.add_route(route)
+            handles.append(self.add_route(route))
+        return handles
 
     def install(self, plugin):
         """ Add a plugin to the list of plugins and prepare it for being
@@ -839,10 +991,48 @@ class Bottle:
 
     def add_route(self, route):
         """ Add a route object, but do not change the :data:`Route.app`
-            attribute."""
+            attribute. Return a handle that can be used to remove it again. """
         self.routes.append(route)
-        self.router.add(route.rule, route.method, route, name=route.name)
+        handle = self.router.add(route.rule, route.method, route,
+                                 name=route.name)
+        self._route_handles.append(handle)
+        route.handle = handle
         if DEBUG: route.prepare()
+        return handle
+
+    def remove_route(self, handle):
+        """ Remove a route registration identified by its router handle. """
+        if not self.router.remove(handle):
+            return False
+        try:
+            index = self._route_handles.index(handle)
+        except ValueError:
+            return True
+        route = self.routes.pop(index)
+        self._route_handles.pop(index)
+        if route.handle is handle:
+            previous = None
+            for remaining in self._route_handles:
+                if remaining.target is route:
+                    previous = remaining
+            route.handle = previous
+        self._remove_mounted_route(handle)
+        return True
+
+    def _remove_mounted_route(self, handle):
+        for app, mounted_routes in list(self._mounted_apps.items()):
+            for index, (mount_handle, route, original_rule) in enumerate(
+                    mounted_routes):
+                if mount_handle is not handle:
+                    continue
+                del mounted_routes[index]
+                route.rule = original_rule
+                if not mounted_routes:
+                    del self._mounted_apps[app]
+                    self._mounts.remove(app)
+                    app.config.pop('_mount.prefix', None)
+                    app.config.pop('_mount.app', None)
+                return
 
     def route(self,
               path=None,
@@ -850,7 +1040,7 @@ class Bottle:
               callback=None,
               name=None,
               apply=None,
-              skip=None, **config):
+              skip=None, return_handle=False, **config):
         """ A decorator to bind a function to a request URL. Example::
 
                 @app.route('/hello/<name>')
@@ -872,6 +1062,8 @@ class Bottle:
               applied to the route callback in addition to installed plugins.
             :param skip: A list of plugins, plugin classes or names. Matching
               plugins are not installed to this route. ``True`` skips all.
+            :param return_handle: Return a list of route handles instead of the
+              callback. Handles can be passed to :meth:`remove_route`.
 
             Any additional keyword arguments are stored as route-specific
             configuration and passed to plugins (see :meth:`Plugin.apply`).
@@ -883,6 +1075,7 @@ class Bottle:
         def decorator(callback):
             if isinstance(callback, str):
                 callback = load(callback) # type: Callable
+            handles = []
             for rule in makelist(path) or yieldroutes(callback):
                 for verb in makelist(method):
                     verb = verb.upper()
@@ -890,8 +1083,8 @@ class Bottle:
                                   name=name,
                                   plugins=plugins,
                                   skiplist=skiplist, **config)
-                    self.add_route(route)
-            return callback
+                    handles.append(self.add_route(route))
+            return handles if return_handle else callback
 
         return decorator(callback) if callback else decorator
 

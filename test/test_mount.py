@@ -126,3 +126,92 @@ class TestAppMerging(ServerTestBase):
         self.assertBody('foo', '/')
         self.assertStatus(200, '/test/bar')
         self.assertBody('bar', '/test/bar')
+
+
+class TestMountRouteRemoval(ServerTestBase):
+    def test_mounted_wsgi_app_registrations_can_be_removed(self):
+        def wsgi_app(environ, start_response):
+            start_response('200 OK', [])
+            return [b'mounted']
+
+        handles = self.app.mount('/raw', wsgi_app)
+
+        self.assertEqual(2, len(handles))
+        self.assertBody('mounted', '/raw')
+        self.assertBody('mounted', '/raw/item')
+
+        for handle in handles:
+            self.assertTrue(self.app.remove_route(handle))
+
+        self.assertStatus(404, '/raw')
+        self.assertStatus(404, '/raw/item')
+
+    def test_mounted_filtered_route_can_be_removed_and_registered_again(self):
+        def pair_filter(config):
+            return r'(\w+)-(\w+)', None, None
+
+        self.app.router.add_filter('pair', pair_filter)
+        child = bottle.Bottle()
+        child.router.add_filter('pair', pair_filter)
+
+        @child.route('/items/<item:pair>')
+        def item(item):
+            return item
+
+        handles = self.app.mount('/api/', child)
+        self.assertEqual(1, len(handles))
+        self.assertBody('one-two', '/api/items/one-two')
+
+        self.assertTrue(self.app.remove_route(handles[0]))
+        self.assertStatus(404, '/api/items/one-two')
+        self.assertFalse(self.app.remove_route(handles[0]))
+        self.assertNotIn(child, self.app._mounts)
+        self.assertNotIn('_mount.app', child.config)
+        self.assertEqual('/items/<item:pair>', child.routes[0].rule)
+
+        handle = self.app.route('/api/items/<item:pair>',
+                                callback=lambda item: 'again:' + item,
+                                return_handle=True)[0]
+        self.assertBody('again:one-two', '/api/items/one-two')
+        self.assertTrue(self.app.remove_route(handle))
+        self.assertStatus(404, '/api/items/one-two')
+
+    def test_route_change_after_match_does_not_affect_current_request(self):
+        handle = {}
+
+        def temporary(id):
+            self.app.remove_route(handle['current'])
+            handle['replacement'] = self.app.route(
+                '/diagnostic/<id:int>',
+                callback=lambda id: 'next:' + str(id),
+                return_handle=True)[0]
+            return 'current:ok'
+
+        handle['current'] = self.app.route(
+            '/diagnostic/<id:int>',
+            callback=temporary,
+            return_handle=True)[0]
+
+        self.assertBody('current:ok', '/diagnostic/12')
+        self.assertBody('next:34', '/diagnostic/34')
+
+        self.assertTrue(self.app.remove_route(handle['replacement']))
+        self.assertStatus(404, '/diagnostic/56')
+        self.assertFalse(self.app.remove_route(handle['current']))
+
+    def test_remove_one_duplicate_route_object_registration(self):
+        def callback(item):
+            return item
+
+        route = bottle.Route(self.app, '/items/<item>', 'GET', callback)
+        first = self.app.add_route(route)
+        second = self.app.add_route(route)
+
+        self.assertBody('one', '/items/one')
+        self.assertTrue(self.app.remove_route(second))
+        self.assertIs(first, self.app.routes[0].handle)
+        self.assertIs(route, self.app.routes[0])
+        self.assertBody('one', '/items/one')
+        self.assertTrue(self.app.remove_route(first))
+        self.assertEqual([], self.app.routes)
+        self.assertStatus(404, '/items/one')

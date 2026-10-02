@@ -161,6 +161,131 @@ class TestRouter(unittest.TestCase):
             self.add('/<:>/'+str(i), str(i), 'GET')
         self.assertEqual(self.match('/foo/'+str(n-1))[0], str(n-1))
 
+    def test_remove_rebuilds_group_positions_across_patterns(self):
+        handles = [self.r.add('/%d/<id>' % i, 'GET', str(i))
+                   for i in range(bottle.Router._MAX_GROUPS_PER_PATTERN + 10)]
+
+        for handle in handles[:-10]:
+            self.assertTrue(handle.remove())
+
+        index = bottle.Router._MAX_GROUPS_PER_PATTERN + 9
+        self.assertEqual(str(index), self.match('/%d/value' % index)[0])
+        self.assertEqual(1, len(self.r.dyna_regexes['GET']))
+
+        for handle in handles[:-10]:
+            self.assertFalse(handle.remove())
+        for handle in handles[-10:]:
+            self.assertTrue(handle.remove())
+
+    def test_remove_static_route_updates_method_set(self):
+        get = self.r.add('/users', 'GET', 'get')
+        post = self.r.add('/users', 'POST', 'post')
+
+        self.assert_error('/users', 'PUT', 405, 'GET,POST')
+        self.assertTrue(get.remove())
+        self.assert_error('/users', 'PUT', 405, 'POST')
+        self.assert_error('/users', 'GET', 405, 'POST')
+        self.assertTrue(post.remove())
+        self.assert_error('/users', 'PUT', 404)
+
+    def test_remove_by_handle_restores_previous_registration(self):
+        generic = self.r.add('/<x>', 'GET', 'generic')
+        specific = self.r.add('/foo', 'GET', 'specific')
+
+        self.assertEqual('specific', self.match('/foo')[0])
+        self.assertTrue(specific.remove())
+        self.assertEqual(('generic', {'x': 'foo'}), self.match('/foo'))
+
+        specific = self.r.add('/foo', 'GET', 'specific-again')
+        self.assertEqual('specific-again', self.match('/foo')[0])
+        self.assertTrue(generic.remove())
+        self.assertEqual('specific-again', self.match('/foo')[0])
+        self.assertTrue(specific.remove())
+        self.assertRaises(bottle.HTTPError, self.match, '/foo')
+        self.assertFalse(specific.remove())
+
+    def test_remove_exact_duplicate_registration(self):
+        first = self.r.add('/item/<id>', 'GET', 'first')
+        second = self.r.add('/item/<id>', 'GET', 'second')
+
+        self.assertEqual('second', self.match('/item/1')[0])
+        self.assertTrue(second.remove())
+        self.assertEqual('first', self.match('/item/1')[0])
+        self.assertFalse(second.remove())
+
+        third = self.r.add('/item/<id>', 'GET', 'third')
+        self.assertEqual('third', self.match('/item/1')[0])
+        self.assertTrue(first.remove())
+        self.assertEqual('third', self.match('/item/1')[0])
+        self.assertTrue(third.remove())
+        self.assertRaises(bottle.HTTPError, self.match, '/item/1')
+
+    def test_remove_updates_named_route_builders(self):
+        first = self.r.add('/old/<id>', 'GET', 'first', name='item')
+        second = self.r.add('/new/<id>', 'GET', 'second', name='item')
+
+        self.assertEqual('/new/1', self.r.build('item', id=1))
+        self.assertTrue(second.remove())
+        self.assertEqual('/old/1', self.r.build('item', id=1))
+        self.assertTrue(first.remove())
+        self.assertRaises(bottle.RouteBuildError, self.r.build, 'item', id=1)
+
+    def assert_error(self, path, method, status, allow=None):
+        with self.assertRaises(bottle.HTTPError) as context:
+            self.match(path, method)
+        self.assertEqual(status, context.exception.status_code)
+        if allow is not None:
+            self.assertEqual(allow, context.exception.headers['Allow'])
+
+    def test_remove_updates_method_sets_and_head_fallback(self):
+        get = self.r.add('/users/<id:int>', 'GET', 'get')
+        post = self.r.add('/users/<id:int>', 'POST', 'post')
+
+        self.assertEqual('get', self.match('/users/1')[0])
+        self.assert_error('/users/1', 'PUT', 405, 'GET,POST')
+
+        self.assertTrue(get.remove())
+        self.assert_error('/users/1', 'GET', 405, 'POST')
+        self.assert_error('/users/1', 'PUT', 405, 'POST')
+        self.assert_error('/users/1', 'HEAD', 405, 'POST')
+
+        head = self.r.add('/users/<id:int>', 'HEAD', 'head')
+        self.assertEqual('head', self.match('/users/1', 'HEAD')[0])
+        options = self.r.add('/users/<id:int>', 'OPTIONS', 'options')
+        self.assert_error('/users/1', 'PUT', 405, 'HEAD,OPTIONS,POST')
+
+        self.assertTrue(post.remove())
+        self.assert_error('/users/1', 'PUT', 405, 'HEAD,OPTIONS')
+        self.assertTrue(head.remove())
+        self.assertTrue(options.remove())
+        self.assert_error('/users/1', 'PUT', 404)
+
+    def test_remove_rebuilds_dynamic_group_positions(self):
+        def pair_filter(config):
+            return r'(\w+)-(\w+)', None, None
+
+        self.r.add_filter('pair', pair_filter)
+        first = self.r.add('/a/<x>', 'GET', 'first')
+        pair = self.r.add('/items/<item:pair>', 'GET', 'pair')
+        fallback = self.r.add('/<other:path>', 'GET', 'fallback')
+
+        self.assertEqual(('first', {'x': '1'}), self.match('/a/1'))
+        self.assertEqual(('pair', {'item': 'one-two'}),
+                         self.match('/items/one-two'))
+        self.assertEqual(('fallback', {'other': 'other'}),
+                         self.match('/other'))
+
+        self.assertTrue(first.remove())
+        self.assertEqual(('pair', {'item': 'one-two'}),
+                         self.match('/items/one-two'))
+        self.assertEqual(('fallback', {'other': 'other'}),
+                         self.match('/other'))
+        self.assertTrue(pair.remove())
+        self.assertEqual(('fallback', {'other': 'items/one-two'}),
+                         self.match('/items/one-two'))
+        self.assertTrue(fallback.remove())
+        self.assertRaises(bottle.HTTPError, self.match, '/items/one-two')
+
 class TestRouterInCGIMode(TestRouter):
     ''' Makes no sense since the default route does not optimize CGI anymore.'''
     CGI = True
